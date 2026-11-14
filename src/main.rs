@@ -15,6 +15,8 @@ const COLS: usize = WIDTH / TILE;
 const ROWS: usize = HEIGHT / TILE;
 const FRAME_BYTES: usize = WIDTH * HEIGHT;
 const PACKET_BYTES: usize = COLS * ROWS / 8;
+const GRAY_LEVELS: [u8; 4] = [16, 89, 162, 235];
+const PACKETS_PER_FRAME: usize = 2;
 const HEADER_BYTES: usize = 64;
 const DATA_SHARDS: usize = 16;
 const PARITY_SHARDS: usize = 8;
@@ -83,39 +85,47 @@ fn make_shards(data: &[u8]) -> (Metadata, Vec<Vec<Vec<u8>>>) {
     (meta, result)
 }
 
-fn packet_to_frame(packet: &[u8]) -> Vec<u8> {
+// Two ordinary BV02 packets share a frame, with two bits per tile.
+fn packets_to_frame(packets: &[u8]) -> Vec<u8> {
+    assert_eq!(packets.len(), PACKET_BYTES * PACKETS_PER_FRAME);
     let mut frame = vec![0u8; FRAME_BYTES];
-    for bit in 0..COLS * ROWS {
-        let value = if packet[bit / 8] & (1 << (7 - bit % 8)) != 0 {
-            235
-        } else {
-            16
-        };
-        let x = (bit % COLS) * TILE;
-        let y = (bit / COLS) * TILE;
+    for tile in 0..COLS * ROWS {
+        let symbol = (packets[tile / 4] >> (6 - 2 * (tile % 4))) & 3;
+        let x = (tile % COLS) * TILE;
+        let y = (tile / COLS) * TILE;
         for dy in 0..TILE {
-            frame[(y + dy) * WIDTH + x..(y + dy) * WIDTH + x + TILE].fill(value);
+            frame[(y + dy) * WIDTH + x..(y + dy) * WIDTH + x + TILE]
+                .fill(GRAY_LEVELS[symbol as usize]);
         }
     }
     frame
 }
 
-fn frame_to_packet(frame: &[u8]) -> Vec<u8> {
-    let mut packet = vec![0u8; PACKET_BYTES];
-    for bit in 0..COLS * ROWS {
-        let x = (bit % COLS) * TILE;
-        let y = (bit / COLS) * TILE;
+fn frame_to_packets(frame: &[u8], four_gray: bool) -> Vec<u8> {
+    let bits = if four_gray { 2 } else { 1 };
+    let mut packets = vec![0u8; PACKET_BYTES * bits];
+    for tile in 0..COLS * ROWS {
+        let x = (tile % COLS) * TILE;
+        let y = (tile / COLS) * TILE;
         let mut sum = 0usize;
         for dy in 2..6 {
             for dx in 2..6 {
                 sum += frame[(y + dy) * WIDTH + x + dx] as usize;
             }
         }
-        if sum >= 16 * 128 {
-            packet[bit / 8] |= 1 << (7 - bit % 8);
-        }
+        let symbol = if four_gray {
+            // Compare the unrounded average with the midpoints between levels.
+            GRAY_LEVELS
+                .windows(2)
+                .filter(|pair| sum * 2 >= 16 * (pair[0] as usize + pair[1] as usize))
+                .count() as u8
+        } else {
+            u8::from(sum >= 16 * 128)
+        };
+        let bit = tile * bits;
+        packets[bit / 8] |= symbol << (8 - bits - bit % 8);
     }
-    packet
+    packets
 }
 
 fn parse_packet(packet: &[u8]) -> Option<(u32, Metadata, Vec<u8>)> {
@@ -308,7 +318,7 @@ fn timeline(groups: usize, full_audio: bool) -> io::Result<Timeline> {
             .ok_or_else(|| io::Error::other("media duration overflow"))?
             .div_ceil(audio::RATE as u64)
     } else {
-        groups as u64 * SHARDS as u64 * COPIES as u64
+        groups as u64 * SHARDS as u64 * COPIES as u64 / PACKETS_PER_FRAME as u64
     };
     // RATE is divisible by FPS: pad audio by less than one video frame.
     Ok(Timeline {
@@ -328,7 +338,7 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
         format!(
             "{}/{}",
             COPIES * audio::RATE,
-            audio::packet_samples(PACKET_BYTES)
+            PACKETS_PER_FRAME * audio::packet_samples(PACKET_BYTES)
         )
     } else {
         FPS.to_string()
@@ -437,12 +447,17 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
         let mut pipe = child.stdin.take().unwrap();
         // Send the same shard position from each group before the next position.
         // Copies are separate passes, so a short burst cannot erase all copies.
+        let mut pending = Vec::with_capacity(PACKET_BYTES * PACKETS_PER_FRAME);
         for _ in 0..COPIES {
             for shard in 0..SHARDS {
                 for (group, shards) in groups.iter().enumerate() {
                     let packet =
                         make_packet((group * SHARDS + shard) as u32, &meta, &shards[shard]);
-                    pipe.write_all(&packet_to_frame(&packet))?;
+                    pending.extend_from_slice(&packet);
+                    if pending.len() == PACKET_BYTES * PACKETS_PER_FRAME {
+                        pipe.write_all(&packets_to_frame(&pending))?;
+                        pending.clear();
+                    }
                 }
             }
         }
@@ -509,7 +524,21 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
                 return Err(io::Error::other("partial decoded frame"));
             }
             frames += 1;
-            if decoder.accept(&frame_to_packet(&frame)) {
+            // CRCs identify the format and reject damaged packets independently.
+            for four_gray in [true, false] {
+                for packet in frame_to_packets(&frame, four_gray)
+                    .as_chunks::<PACKET_BYTES>()
+                    .0
+                {
+                    if decoder.accept(packet) {
+                        break;
+                    }
+                }
+                if decoder.recovered.is_some() {
+                    break;
+                }
+            }
+            if decoder.recovered.is_some() {
                 break;
             }
         }
@@ -645,10 +674,13 @@ mod tests {
     fn fast_timeline_and_audio_budget() {
         for groups in [1, 3, 4, 100] {
             let t = timeline(groups, false).unwrap();
-            assert_eq!(t.frames, (groups * SHARDS * COPIES) as u64);
+            assert_eq!(
+                t.frames,
+                (groups * SHARDS * COPIES / PACKETS_PER_FRAME) as u64
+            );
             assert_eq!(t.samples * FPS as u64, t.frames * audio::RATE as u64);
         }
-        assert_eq!(timeline(1, false).unwrap().frames, 72);
+        assert_eq!(timeline(1, false).unwrap().frames, 36);
     }
 
     #[test]
@@ -675,18 +707,62 @@ mod tests {
     }
 
     #[test]
+    fn four_gray_levels_and_brightness_tolerance() {
+        // 00, 01, 10, 11 in every byte exercises all four levels equally.
+        let packed = vec![0b00011011; PACKET_BYTES * PACKETS_PER_FRAME];
+        let frame = packets_to_frame(&packed);
+        for (tile, level) in GRAY_LEVELS.iter().enumerate() {
+            assert_eq!(frame[tile * TILE], *level);
+        }
+        for offset in [-24i16, 0, 24] {
+            let shifted: Vec<u8> = frame
+                .iter()
+                .map(|&v| (v as i16 + offset).clamp(0, 255) as u8)
+                .collect();
+            assert_eq!(frame_to_packets(&shifted, true), packed);
+        }
+    }
+
+    #[test]
+    fn decodes_legacy_binary_tiles() {
+        let (meta, groups) = make_shards(b"legacy");
+        let packet = make_packet(0, &meta, &groups[0][0]);
+        let mut frame = vec![0; FRAME_BYTES];
+        for tile in 0..COLS * ROWS {
+            let value = if packet[tile / 8] & (1 << (7 - tile % 8)) != 0 {
+                235
+            } else {
+                16
+            };
+            let x = tile % COLS * TILE;
+            let y = tile / COLS * TILE;
+            for dy in 0..TILE {
+                frame[(y + dy) * WIDTH + x..(y + dy) * WIDTH + x + TILE].fill(value);
+            }
+        }
+        assert_eq!(frame_to_packets(&frame, false), packet);
+        assert!(frame_to_packets(&frame, true)
+            .as_chunks::<PACKET_BYTES>()
+            .0
+            .iter()
+            .all(|p| parse_packet(p).is_none()));
+    }
+
+    #[test]
     fn tile_noise_and_corrupt_packets() {
         let (meta, groups) = make_shards(b"tile test");
         let packet = make_packet(0, &meta, &groups[0][0]);
-        let mut frame = packet_to_frame(&packet);
-        // Change one center pixel in every tile; the average still identifies the bit.
+        let second = make_packet(1, &meta, &groups[0][1]);
+        let packed = [packet.clone(), second].concat();
+        let mut frame = packets_to_frame(&packed);
+        // Change one center pixel in every tile; the average still identifies the two-bit symbol.
         for y in 0..ROWS {
             for x in 0..COLS {
                 let i = (y * TILE + 3) * WIDTH + x * TILE + 3;
                 frame[i] = 255 - frame[i];
             }
         }
-        assert_eq!(frame_to_packet(&frame), packet);
+        assert_eq!(frame_to_packets(&frame, true), packed);
         assert!(parse_packet(&packet).is_some());
         let mut corrupt = packet.clone();
         corrupt[HEADER_BYTES] ^= 1;

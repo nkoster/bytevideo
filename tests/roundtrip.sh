@@ -7,7 +7,7 @@ trap 'rm -rf "$work"' EXIT
 bin=./target/release/bytevideo
 python3 - "$work/input.bin" <<'PY'
 import random, sys
-open(sys.argv[1], 'wb').write(random.Random(42).randbytes(100000))
+open(sys.argv[1], 'wb').write(random.Random(42).randbytes(200000))
 PY
 "$bin" encode "$work/input.bin" "$work/original.mp4"
 python3 - "$work/original.mp4" <<'PY'
@@ -23,10 +23,10 @@ print('Matched A/V timeline:', v['duration'], a['duration'])
 PY
 "$bin" decode "$work/original.mp4" "$work/plain.bin" | tee "$work/decode.log"
 cmp "$work/input.bin" "$work/plain.bin"
-# There are four groups. After 16 shard rounds (64 frames), SHA-256 is
+# There are eight groups, packed two packets per frame. After 64 frames, SHA-256 is
 # verified: the decoder must stop without reading either audio or later copies.
 rg -q '64 video frames read; audio skipped' "$work/decode.log"
-# Remove all copies of eight shard positions in all four groups; video alone suffices.
+# Remove all copies of eight shard positions in all eight groups; video alone suffices.
 ffmpeg -v error -i "$work/original.mp4" -vf "select='gte(mod(n,96),32)',setpts=N/(30*TB)" \
   -fps_mode vfr -an -c:v libx264 -crf 28 "$work/dropped.mp4"
 "$bin" decode "$work/dropped.mp4" "$work/dropped.bin"
@@ -34,7 +34,7 @@ cmp "$work/input.bin" "$work/dropped.bin"
 # Nine missing shards in group zero, eight elsewhere: video alone fails.
 # Compact audio supplies parity shard 16 of group zero and makes recovery possible.
 ffmpeg -v error -i "$work/original.mp4" \
-  -vf "select='gte(mod(n,96),32)*not(eq(mod(n,96),64))',setpts=N/(30*TB)" \
+  -vf "drawbox=x=0:y=0:w=iw:h=ih/2:color=black:t=fill:enable='eq(mod(n,96),64)',select='gte(mod(n,96),32)',setpts=N/(30*TB)" \
   -fps_mode vfr -an -c:v libx264 -crf 28 "$work/insufficient.mp4"
 if "$bin" decode "$work/insufficient.mp4" "$work/must-not-exist.bin"; then
   echo 'Expected recovery to fail' >&2; exit 1
@@ -51,11 +51,11 @@ ffmpeg -v error -i "$work/original.mp4" \
   -an -c:v libx264 -crf 28 "$work/damaged.mp4"
 "$bin" decode "$work/damaged.mp4" "$work/damaged.bin"
 cmp "$work/input.bin" "$work/damaged.bin"
-# Tiny input: trimmed zero padding lets useful repair packets fit in 2.4 seconds.
+# Tiny input: trimmed zero padding lets useful repair packets fit in 1.2 seconds.
 printf 'test' > "$work/tiny.bin"
 "$bin" encode "$work/tiny.bin" "$work/tiny.mp4"
 ffmpeg -v error -i "$work/tiny.mp4" \
-  -vf "select='gte(mod(n,24),8)*not(eq(mod(n,24),16))',setpts=N/(30*TB)" \
+  -vf "drawbox=x=0:y=0:w=iw:h=ih/2:color=black:t=fill:enable='eq(mod(n,12),8)',select='gte(mod(n,12),4)',setpts=N/(30*TB)" \
   -fps_mode vfr -c:v libx264 -crf 28 -c:a aac -b:a 128k "$work/tiny-damaged.mp4"
 "$bin" decode "$work/tiny-damaged.mp4" "$work/tiny-recovered.bin"
 cmp "$work/tiny.bin" "$work/tiny-recovered.bin"
