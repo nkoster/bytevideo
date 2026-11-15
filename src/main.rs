@@ -1,14 +1,19 @@
 mod audio;
 mod progress;
 mod repair;
+mod streaming;
 use progress::Progress;
 use reed_solomon_erasure::galois_8::ReedSolomon;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use streaming::{Decoder, PreparedInput, Workspace};
 
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
@@ -64,6 +69,7 @@ fn make_packet(index: u32, meta: &Metadata, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
+#[cfg(test)]
 fn make_shards(data: &[u8]) -> (Metadata, Vec<Vec<Vec<u8>>>) {
     let groups = data.len().div_ceil(DATA_BYTES * DATA_SHARDS).max(1);
     let meta = Metadata {
@@ -159,6 +165,7 @@ fn parse_packet(packet: &[u8]) -> Option<(u32, Metadata, Vec<u8>)> {
     ))
 }
 
+#[cfg(test)]
 fn recover(meta: &Metadata, packets: &BTreeMap<u32, Vec<u8>>) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     for group in 0..meta.groups {
@@ -183,27 +190,6 @@ fn recover(meta: &Metadata, packets: &BTreeMap<u32, Vec<u8>>) -> io::Result<Vec<
     Ok(data)
 }
 
-struct TempAudio(std::path::PathBuf);
-impl TempAudio {
-    fn new() -> io::Result<Self> {
-        let base = env::temp_dir();
-        for serial in 0..1000 {
-            let path = base.join(format!("bytevideo-{}-{serial}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(io::Error::other("cannot create audio workspace"))
-    }
-}
-impl Drop for TempAudio {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[cfg(test)]
 fn insert_packet(
     packet: &[u8],
@@ -220,41 +206,21 @@ fn insert_packet(
     }
 }
 
-#[derive(Default)]
-struct Decoder {
-    metadata: Option<Metadata>,
-    packets: BTreeMap<u32, Vec<u8>>,
-    counts: BTreeMap<u32, usize>,
-    ready: usize,
-    recovered: Option<Vec<u8>>,
-}
-impl Decoder {
-    fn accept(&mut self, packet: &[u8]) -> bool {
-        let Some((index, meta, payload)) = parse_packet(packet) else {
-            return false;
-        };
-        if self.metadata.is_none() {
-            self.metadata = Some(meta.clone());
-        }
-        if self.metadata.as_ref() != Some(&meta) || self.packets.contains_key(&index) {
-            return false;
-        }
-        self.packets.insert(index, payload);
-        let count = self.counts.entry(index / SHARDS as u32).or_default();
-        *count += 1;
-        if *count == DATA_SHARDS {
-            self.ready += 1;
-        }
-        if self.ready == meta.groups as usize {
-            self.recovered = recover(&meta, &self.packets).ok();
-        }
-        self.recovered.is_some()
-    }
-}
-
 fn decode_audio(input: &str, decoder: &mut Decoder, compact: bool) -> io::Result<bool> {
+    let mut assembler = if compact {
+        match repair::Assembler::new() {
+            Ok(assembler) => Some(assembler),
+            Err(e) => {
+                decoder.fail(e);
+                return Ok(false);
+            }
+        }
+    } else {
+        None
+    };
     let mut child = Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-v",
             "error",
             "-i",
@@ -270,10 +236,12 @@ fn decode_audio(input: &str, decoder: &mut Decoder, compact: bool) -> io::Result
             "f32le",
             "-",
         ])
+        // FFmpeg must not read or change the user's terminal. Early stopping
+        // can kill it before it restores terminal echo/canonical mode.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut assembler = repair::Assembler::default();
     let mut recognised = false;
     let reader = progress::AudioReader::new(io::BufReader::new(child.stdout.take().unwrap()));
     let result = audio::read_packets_until(
@@ -281,17 +249,23 @@ fn decode_audio(input: &str, decoder: &mut Decoder, compact: bool) -> io::Result
         if compact { repair::BYTES } else { PACKET_BYTES },
         |packet| {
             if compact {
-                if let Some(packet) = assembler.accept(packet) {
-                    recognised = true;
-                    return decoder.accept(&packet);
+                match assembler.as_mut().unwrap().accept(packet) {
+                    Ok(Some(packet)) => {
+                        recognised = true;
+                        decoder.accept(&packet)
+                    }
+                    Ok(None) => false,
+                    Err(e) => {
+                        decoder.fail(e);
+                        true
+                    }
                 }
-                false
             } else {
                 decoder.accept(packet)
             }
         },
     );
-    let complete = decoder.recovered.is_some();
+    let complete = decoder.stopped();
     if result.is_err() || complete {
         let _ = child.kill();
     }
@@ -331,14 +305,10 @@ fn timeline(groups: usize, full_audio: bool) -> io::Result<Timeline> {
 }
 
 fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
-    let data = fs::read(input)?;
-    if data.len().div_ceil(DATA_BYTES * DATA_SHARDS).max(1) > (u32::MAX as usize / SHARDS) {
-        return Err(io::Error::other("input too large"));
-    }
-    let mut preparation = Progress::new("Preparing data", None);
-    let (meta, groups) = make_shards(&data);
-    preparation.finish();
-    let timeline = timeline(groups.len(), full_audio)?;
+    let mut prepared = PreparedInput::new(Path::new(input))?;
+    let groups = prepared.metadata.groups;
+    let size = prepared.metadata.size;
+    let timeline = timeline(groups as usize, full_audio)?;
     let input_rate = if full_audio {
         format!(
             "{}/{}",
@@ -352,7 +322,7 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
         "fps={FPS}:round=up,tpad=stop_mode=clone:stop_duration=1,trim=end_frame={}",
         timeline.frames
     );
-    let temp = TempAudio::new()?;
+    let temp = Workspace::new()?;
     let audio_path = temp.0.join("audio.f32le");
     {
         let mut writer = io::BufWriter::new(fs::File::create(&audio_path)?);
@@ -360,11 +330,8 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
         let mut progress = Progress::new("Preparing audio", Some(timeline.samples));
         if full_audio {
             for shard in 0..SHARDS {
-                for (group, shards) in groups.iter().enumerate() {
-                    audio::write_packet(
-                        &mut writer,
-                        &make_packet((group * SHARDS + shard) as u32, &meta, &shards[shard]),
-                    )?;
+                for group in 0..groups {
+                    audio::write_packet(&mut writer, &prepared.packet(group, shard)?)?;
                     written += audio::packet_samples(PACKET_BYTES) as u64;
                     progress.update(written, Some(timeline.samples));
                 }
@@ -374,10 +341,9 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
             // only: no truncated FSK symbols or packets at the end of the video.
             let mut budget = timeline.samples / audio::packet_samples(repair::BYTES) as u64;
             'packets: for shard in (DATA_SHARDS..SHARDS).chain(0..DATA_SHARDS) {
-                for (group, shards) in groups.iter().enumerate() {
-                    let index = (group * SHARDS + shard) as u32;
-                    let parts =
-                        repair::fragments(index, &make_packet(index, &meta, &shards[shard]));
+                for group in 0..groups {
+                    let index = group * SHARDS as u32 + shard as u32;
+                    let parts = repair::fragments(index, &prepared.packet(group, shard)?);
                     if parts.len() as u64 > budget {
                         continue;
                     }
@@ -404,8 +370,11 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
         writer.flush()?;
         progress.finish();
     }
+    let video_workspace = Workspace::beside(Path::new(output))?;
+    let staged_video = video_workspace.0.join("video.mp4");
     let mut child = Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-y",
             "-nostats",
             "-progress",
@@ -456,16 +425,18 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
             &audio::RATE.to_string(),
             "-movflags",
             "+faststart",
-            output,
+            staged_video
+                .to_str()
+                .ok_or_else(|| io::Error::other("invalid output path"))?,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    let output = child.stdout.take().unwrap();
+    let progress_output = child.stdout.take().unwrap();
     let total_frames = timeline.frames;
     let progress_thread = std::thread::spawn(move || {
         let mut progress = Progress::new("Encoding video ", Some(total_frames));
-        for line in io::BufReader::new(output).lines() {
+        for line in io::BufReader::new(progress_output).lines() {
             let Ok(line) = line else { break };
             if let Some(frame) = line
                 .strip_prefix("frame=")
@@ -483,9 +454,8 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
         let mut pending = Vec::with_capacity(PACKET_BYTES * PACKETS_PER_FRAME);
         for _ in 0..COPIES {
             for shard in 0..SHARDS {
-                for (group, shards) in groups.iter().enumerate() {
-                    let packet =
-                        make_packet((group * SHARDS + shard) as u32, &meta, &shards[shard]);
+                for group in 0..groups {
+                    let packet = prepared.packet(group, shard)?;
                     pending.extend_from_slice(&packet);
                     if pending.len() == PACKET_BYTES * PACKETS_PER_FRAME {
                         pipe.write_all(&packets_to_frame(&pending))?;
@@ -507,10 +477,12 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
     if !status?.success() {
         return Err(io::Error::other("ffmpeg encoding failed"));
     }
+    fs::File::open(&staged_video)?.sync_all()?;
+    fs::rename(&staged_video, output)?;
     progress.finish();
     println!(
         "Encoded {} bytes into {} frames ({:.3} seconds, audio and video)",
-        data.len(),
+        size,
         timeline.frames,
         timeline.samples as f64 / audio::RATE as f64
     );
@@ -518,8 +490,10 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
 }
 
 fn decode(input: &str, output: &str) -> io::Result<()> {
+    let mut decoder = Decoder::new(Path::new(output))?;
     let mut child = Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-v",
             "error",
             "-i",
@@ -537,11 +511,13 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
             "gray",
             "-",
         ])
+        // FFmpeg must not read or change the user's terminal. Early stopping
+        // can kill it before it restores terminal echo/canonical mode.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     let mut reader = child.stdout.take().unwrap();
-    let mut decoder = Decoder::default();
     let mut frames = 0usize;
     let mut frame = vec![0u8; FRAME_BYTES];
     let mut progress = Progress::new("Decoding video", None);
@@ -572,27 +548,26 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
                         break;
                     }
                 }
-                if decoder.recovered.is_some() {
+                if decoder.stopped() {
                     break;
                 }
             }
-            let useful: usize = decoder.counts.values().map(|&n| n.min(DATA_SHARDS)).sum();
             let total = decoder
                 .metadata
                 .as_ref()
                 .map(|m| m.groups as u64 * DATA_SHARDS as u64);
-            progress.update(useful as u64, total);
-            if decoder.recovered.is_some() {
+            progress.update(decoder.useful, total);
+            if decoder.stopped() {
                 break;
             }
         }
         Ok(())
     })();
-    if decoder.recovered.is_some() {
+    if decoder.verified {
         progress.finish();
     }
     drop(progress);
-    let complete = decoder.recovered.is_some();
+    let complete = decoder.stopped();
     // A verified early stop deliberately closes the pipe. Reap ffmpeg and do not
     // report its expected SIGPIPE/termination as a decoding error.
     if video_result.is_err() || complete {
@@ -600,6 +575,7 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
     }
     drop(reader);
     let status = child.wait()?;
+    decoder.check_error()?;
     let mut audio_used = false;
     if !complete {
         audio_used = true;
@@ -607,24 +583,17 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
             eprintln!("Video incomplete; trying audio repair");
         }
         let compact = decode_audio(input, &mut decoder, true).unwrap_or(false);
+        decoder.check_error()?;
         // Old BV02 files and --full-audio use the original full-packet modem.
-        if !compact && decoder.recovered.is_none() {
+        if !compact && !decoder.stopped() {
             let _ = decode_audio(input, &mut decoder, false);
+            decoder.check_error()?;
         }
     }
-    let data = match decoder.recovered {
-        Some(data) => data,
-        None => {
-            let meta = decoder
-                .metadata
-                .ok_or_else(|| io::Error::other("no valid BV02 packets found"))?;
-            recover(&meta, &decoder.packets)?
-        }
-    };
-    fs::write(output, &data)?;
+    let size = decoder.finish(Path::new(output))?;
     println!(
         "Recovered {} bytes into {} ({} video frames read; audio {})",
-        data.len(),
+        size,
         output,
         frames,
         if audio_used { "used" } else { "skipped" }
@@ -734,18 +703,26 @@ mod tests {
     #[test]
     fn decoder_only_stops_after_verified_reconstruction() {
         let (mut meta, groups) = make_shards(b"verified");
-        let mut decoder = Decoder::default();
+        let work = Workspace::new().unwrap();
+        let output = work.0.join("restored");
+        let mut decoder = Decoder::new(&output).unwrap();
         for (i, payload) in groups[0].iter().enumerate().take(DATA_SHARDS - 1) {
             assert!(!decoder.accept(&make_packet(i as u32, &meta, payload)));
         }
         assert!(decoder.accept(&make_packet(15, &meta, &groups[0][15])));
-        assert_eq!(decoder.recovered.unwrap(), b"verified");
+        assert!(decoder.verified);
+        decoder.finish(&output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"verified");
         meta.hash[0] ^= 1;
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::new(&output).unwrap();
         for (i, payload) in groups[0].iter().enumerate() {
-            assert!(!decoder.accept(&make_packet(i as u32, &meta, payload)));
+            if decoder.accept(&make_packet(i as u32, &meta, payload)) {
+                break;
+            }
         }
-        assert!(decoder.recovered.is_none());
+        assert!(!decoder.verified);
+        assert!(decoder.finish(&output).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"verified");
     }
 
     #[test]

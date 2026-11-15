@@ -59,4 +59,29 @@ ffmpeg -v error -i "$work/tiny.mp4" \
   -fps_mode vfr -c:v libx264 -crf 28 -c:a aac -b:a 128k "$work/tiny-damaged.mp4"
 "$bin" decode "$work/tiny-damaged.mp4" "$work/tiny-recovered.bin"
 cmp "$work/tiny.bin" "$work/tiny-recovered.bin"
+# Both operations preserve an existing destination if recovery/FFmpeg fails.
+printf 'keep existing output' > "$work/expected-existing.bin"
+cp "$work/expected-existing.bin" "$work/existing.bin"
+if "$bin" decode "$work/insufficient.mp4" "$work/existing.bin"; then
+  echo 'Expected recovery to fail without replacing existing output' >&2; exit 1
+fi
+cmp "$work/expected-existing.bin" "$work/existing.bin"
+mkdir "$work/fakebin" "$work/tmp"
+cat > "$work/fakebin/ffmpeg" <<'SH'
+#!/usr/bin/env bash
+# Simulate FFmpeg failing after creating an incomplete output.
+for output do :; done
+printf 'partial MP4' > "$output"
+exit 1
+SH
+chmod +x "$work/fakebin/ffmpeg"
+if PATH="$work/fakebin:$PATH" TMPDIR="$work/tmp" "$bin" encode "$work/tiny.bin" "$work/existing.bin"; then
+  echo 'Expected FFmpeg failure' >&2; exit 1
+fi
+cmp "$work/expected-existing.bin" "$work/existing.bin"
+python3 - "$work" <<'PY_CHECK'
+from pathlib import Path
+import sys
+assert not list(Path(sys.argv[1]).rglob('.bytevideo-*')), 'Temporary workspace leaked'
+PY_CHECK
 echo 'All fast MP4 roundtrip checks passed'
