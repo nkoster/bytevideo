@@ -93,9 +93,9 @@ fn make_shards(data: &[u8]) -> (Metadata, Vec<Vec<Vec<u8>>>) {
     (meta, result)
 }
 
-// Soft RGB tints in YUV: chroma changes the appearance, never the data luma.
+// Soft Rasta tints (red, yellow, green) in YUV: chroma never changes data luma.
 fn tile_chroma(level: u8, hue: usize) -> (u8, u8) {
-    let (u, v) = [(-16i16, 40i16), (-24, -28), (40, -8)][hue];
+    let (u, v) = [(-16i16, 40i16), (-40, 8), (-24, -28)][hue];
     // Reduce saturation near black/white so displayed RGB stays within gamut.
     let strength = i16::from(level.min(255 - level).min(64));
     (
@@ -969,8 +969,8 @@ mod tests {
             assert_eq!(color[FRAME_BYTES + FRAME_BYTES / 4 + tile * TILE / 2], v);
             match hue {
                 0 => assert!(u < 128 && v > 128),
-                1 => assert!(u < 128 && v < 128),
-                _ => assert!(u > 128 && v < 128),
+                1 => assert!(u < 128 && v > 128 && 128 - u > v - 128),
+                _ => assert!(u < 128 && v < 128),
             }
         }
     }
