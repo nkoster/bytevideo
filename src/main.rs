@@ -17,12 +17,18 @@ use streaming::{Decoder, PreparedInput, Workspace};
 
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
-const TILE: usize = 8;
+const DEFAULT_TILE_SIZE: usize = 8;
+#[cfg(test)]
+const TILE: usize = DEFAULT_TILE_SIZE;
+#[cfg(test)]
 const COLS: usize = WIDTH / TILE;
+#[cfg(test)]
 const ROWS: usize = HEIGHT / TILE;
 const FRAME_BYTES: usize = WIDTH * HEIGHT;
-const PACKET_BYTES: usize = COLS * ROWS / 8;
+// Keep BV02 packet/audio sizes independent of the video tile size.
+const PACKET_BYTES: usize = 1800;
 const GRAY_LEVELS: [u8; 4] = [16, 89, 162, 235];
+#[cfg(test)]
 const PACKETS_PER_FRAME: usize = 2;
 const HEADER_BYTES: usize = 64;
 const DATA_SHARDS: usize = 16;
@@ -104,37 +110,67 @@ fn tile_chroma(level: u8, hue: usize) -> (u8, u8) {
     )
 }
 
+// Whole bytes stay on one tile row; unused right/bottom pixels are padding.
+struct TileGeometry {
+    size: usize,
+    cols: usize,
+    rows: usize,
+}
+
+impl TileGeometry {
+    fn new(size: usize) -> Self {
+        assert!((2..=10).contains(&size));
+        Self {
+            size,
+            cols: WIDTH / size / 4 * 4,
+            rows: HEIGHT / size,
+        }
+    }
+
+    fn packets_per_frame(&self) -> usize {
+        self.cols * self.rows / (4 * PACKET_BYTES)
+    }
+}
+
 // A byte covers four tiles. Precompute their row bytes for every starting hue
 // and data value, then copy those rows into one reusable frame buffer.
 struct BytePattern {
-    y: [u8; TILE * 4],
-    u: [u8; TILE * 2],
-    v: [u8; TILE * 2],
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
 }
 
 struct ByteLayout {
     y: usize,
     uv: usize,
     palette: usize,
+    uv_rows: usize,
 }
 
 struct FrameRenderer {
     color: bool,
+    tile_size: usize,
     patterns: Vec<BytePattern>,
     layouts: Vec<ByteLayout>,
     frame: Vec<u8>,
 }
 
 impl FrameRenderer {
+    #[cfg(test)]
     fn new(color: bool) -> Self {
+        Self::with_tile_size(color, DEFAULT_TILE_SIZE)
+    }
+
+    fn with_tile_size(color: bool, tile_size: usize) -> Self {
+        let geometry = TileGeometry::new(tile_size);
         let hues = if color { 3 } else { 1 };
         let mut patterns = Vec::with_capacity(hues * 256);
         for hue in 0..hues {
             for byte in 0..256u16 {
                 let mut pattern = BytePattern {
-                    y: [0; TILE * 4],
-                    u: [128; TILE * 2],
-                    v: [128; TILE * 2],
+                    y: vec![0; tile_size * 4],
+                    u: vec![128; tile_size * 2],
+                    v: vec![128; tile_size * 2],
                 };
                 for tile in 0..4 {
                     let symbol = (byte >> (6 - 2 * tile)) & 3;
@@ -145,23 +181,28 @@ impl FrameRenderer {
                     } else {
                         level
                     };
-                    pattern.y[tile * TILE..(tile + 1) * TILE].fill(luma);
+                    pattern.y[tile * tile_size..(tile + 1) * tile_size].fill(luma);
                     if color {
                         let (u, v) = tile_chroma(level, (hue + tile) % 3);
-                        pattern.u[tile * TILE / 2..(tile + 1) * TILE / 2].fill(u);
-                        pattern.v[tile * TILE / 2..(tile + 1) * TILE / 2].fill(v);
+                        pattern.u
+                            [(tile * tile_size).div_ceil(2)..((tile + 1) * tile_size).div_ceil(2)]
+                            .fill(u);
+                        pattern.v
+                            [(tile * tile_size).div_ceil(2)..((tile + 1) * tile_size).div_ceil(2)]
+                            .fill(v);
                     }
                 }
                 patterns.push(pattern);
             }
         }
-        let layouts = (0..PACKET_BYTES * PACKETS_PER_FRAME)
+        let layouts = (0..PACKET_BYTES * geometry.packets_per_frame())
             .map(|byte| {
-                let row = byte / (COLS / 4);
-                let column = byte % (COLS / 4) * 4;
+                let row = byte / (geometry.cols / 4);
+                let column = byte % (geometry.cols / 4) * 4;
                 ByteLayout {
-                    y: row * TILE * WIDTH + column * TILE,
-                    uv: row * (TILE / 2) * (WIDTH / 2) + column * TILE / 2,
+                    y: row * tile_size * WIDTH + column * tile_size,
+                    uv: (row * tile_size).div_ceil(2) * (WIDTH / 2) + column * tile_size / 2,
+                    uv_rows: ((row + 1) * tile_size).div_ceil(2) - (row * tile_size).div_ceil(2),
                     palette: if color { ((column + row) % 3) * 256 } else { 0 },
                 }
             })
@@ -173,9 +214,14 @@ impl FrameRenderer {
         };
         Self {
             color,
+            tile_size,
             patterns,
             layouts,
-            frame: vec![0; bytes],
+            frame: {
+                let mut frame = vec![128; bytes];
+                frame[..FRAME_BYTES].fill(if color { 30 } else { 16 });
+                frame
+            },
         }
     }
 
@@ -183,16 +229,16 @@ impl FrameRenderer {
         assert_eq!(packets.len(), self.layouts.len());
         for (&byte, layout) in packets.iter().zip(&self.layouts) {
             let pattern = &self.patterns[layout.palette + byte as usize];
-            for dy in 0..TILE {
+            for dy in 0..self.tile_size {
                 let start = layout.y + dy * WIDTH;
-                self.frame[start..start + TILE * 4].copy_from_slice(&pattern.y);
+                self.frame[start..start + self.tile_size * 4].copy_from_slice(&pattern.y);
             }
             if self.color {
-                for dy in 0..TILE / 2 {
+                for dy in 0..layout.uv_rows {
                     let start = FRAME_BYTES + layout.uv + dy * (WIDTH / 2);
-                    self.frame[start..start + TILE * 2].copy_from_slice(&pattern.u);
+                    self.frame[start..start + self.tile_size * 2].copy_from_slice(&pattern.u);
                     let start = start + FRAME_BYTES / 4;
-                    self.frame[start..start + TILE * 2].copy_from_slice(&pattern.v);
+                    self.frame[start..start + self.tile_size * 2].copy_from_slice(&pattern.v);
                 }
             }
         }
@@ -247,26 +293,34 @@ fn reference_frame(packets: &[u8], color: bool) -> Vec<u8> {
     frame
 }
 
+#[cfg(test)]
 fn frame_to_packets(frame: &[u8], four_gray: bool) -> Vec<u8> {
+    frame_to_packets_sized(frame, four_gray, DEFAULT_TILE_SIZE)
+}
+
+fn frame_to_packets_sized(frame: &[u8], four_gray: bool, tile_size: usize) -> Vec<u8> {
+    let geometry = TileGeometry::new(tile_size);
     let bits = if four_gray { 2 } else { 1 };
-    let mut packets = vec![0u8; PACKET_BYTES * bits];
-    for tile in 0..COLS * ROWS {
-        let x = (tile % COLS) * TILE;
-        let y = (tile / COLS) * TILE;
+    let bytes = geometry.cols * geometry.rows * bits / 8 / PACKET_BYTES * PACKET_BYTES;
+    let mut packets = vec![0u8; bytes];
+    let margin = geometry.size / 4;
+    let samples = (geometry.size - 2 * margin).pow(2);
+    for tile in 0..bytes * 8 / bits {
+        let x = (tile % geometry.cols) * geometry.size;
+        let y = (tile / geometry.cols) * geometry.size;
         let mut sum = 0usize;
-        for dy in 2..6 {
-            for dx in 2..6 {
+        for dy in margin..geometry.size - margin {
+            for dx in margin..geometry.size - margin {
                 sum += frame[(y + dy) * WIDTH + x + dx] as usize;
             }
         }
         let symbol = if four_gray {
-            // Compare the unrounded average with the midpoints between levels.
             GRAY_LEVELS
                 .windows(2)
-                .filter(|pair| sum * 2 >= 16 * (pair[0] as usize + pair[1] as usize))
+                .filter(|pair| sum * 2 >= samples * (pair[0] as usize + pair[1] as usize))
                 .count() as u8
         } else {
-            u8::from(sum >= 16 * 128)
+            u8::from(sum >= samples * 128)
         };
         let bit = tile * bits;
         packets[bit / 8] |= symbol << (8 - bits - bit % 8);
@@ -422,7 +476,16 @@ struct Timeline {
     samples: u64,
 }
 
+#[cfg(test)]
 fn timeline(groups: usize, full_audio: bool) -> io::Result<Timeline> {
+    timeline_sized(groups, full_audio, PACKETS_PER_FRAME)
+}
+
+fn timeline_sized(
+    groups: usize,
+    full_audio: bool,
+    packets_per_frame: usize,
+) -> io::Result<Timeline> {
     let samples = (groups as u64)
         .checked_mul(SHARDS as u64)
         .and_then(|n| n.checked_mul(audio::packet_samples(PACKET_BYTES) as u64))
@@ -433,7 +496,7 @@ fn timeline(groups: usize, full_audio: bool) -> io::Result<Timeline> {
             .ok_or_else(|| io::Error::other("media duration overflow"))?
             .div_ceil(audio::RATE as u64)
     } else {
-        groups as u64 * SHARDS as u64 * COPIES as u64 / PACKETS_PER_FRAME as u64
+        (groups as u64 * SHARDS as u64 * COPIES as u64).div_ceil(packets_per_frame as u64)
     };
     // RATE is divisible by FPS: pad audio by less than one video frame.
     Ok(Timeline {
@@ -442,16 +505,23 @@ fn timeline(groups: usize, full_audio: bool) -> io::Result<Timeline> {
     })
 }
 
-fn encode(input: &str, output: &str, full_audio: bool, color: bool) -> io::Result<()> {
+fn encode(
+    input: &str,
+    output: &str,
+    full_audio: bool,
+    color: bool,
+    tile_size: usize,
+) -> io::Result<()> {
+    let packets_per_frame = TileGeometry::new(tile_size).packets_per_frame();
     let mut prepared = PreparedInput::new(Path::new(input))?;
     let groups = prepared.metadata.groups;
     let size = prepared.metadata.size;
-    let timeline = timeline(groups as usize, full_audio)?;
+    let timeline = timeline_sized(groups as usize, full_audio, packets_per_frame)?;
     let input_rate = if full_audio {
         format!(
             "{}/{}",
             COPIES * audio::RATE,
-            PACKETS_PER_FRAME * audio::packet_samples(PACKET_BYTES)
+            packets_per_frame * audio::packet_samples(PACKET_BYTES)
         )
     } else {
         FPS.to_string()
@@ -589,19 +659,23 @@ fn encode(input: &str, output: &str, full_audio: bool, color: bool) -> io::Resul
         let mut pipe = child.stdin.take().unwrap();
         // Send the same shard position from each group before the next position.
         // Copies are separate passes, so a short burst cannot erase all copies.
-        let mut pending = Vec::with_capacity(PACKET_BYTES * PACKETS_PER_FRAME);
-        let mut renderer = FrameRenderer::new(color);
+        let mut pending = Vec::with_capacity(PACKET_BYTES * packets_per_frame);
+        let mut renderer = FrameRenderer::with_tile_size(color, tile_size);
         for _ in 0..COPIES {
             for shard in 0..SHARDS {
                 for group in 0..groups {
                     let packet = prepared.packet(group, shard)?;
                     pending.extend_from_slice(&packet);
-                    if pending.len() == PACKET_BYTES * PACKETS_PER_FRAME {
+                    if pending.len() == PACKET_BYTES * packets_per_frame {
                         pipe.write_all(renderer.render(&pending))?;
                         pending.clear();
                     }
                 }
             }
+        }
+        if !pending.is_empty() {
+            pending.resize(PACKET_BYTES * packets_per_frame, 0);
+            pipe.write_all(renderer.render(&pending))?;
         }
         Ok(())
     })();
@@ -658,6 +732,7 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
         .spawn()?;
     let mut reader = child.stdout.take().unwrap();
     let mut frames = 0usize;
+    let mut detected_format = None;
     let mut frame = vec![0u8; FRAME_BYTES];
     let mut progress = Progress::new("Decoding video", None);
     let video_result = (|| -> io::Result<()> {
@@ -677,17 +752,26 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
                 return Err(io::Error::other("partial decoded frame"));
             }
             frames += 1;
-            // CRCs identify the format and reject damaged packets independently.
-            for four_gray in [true, false] {
-                for packet in frame_to_packets(&frame, four_gray)
-                    .as_chunks::<PACKET_BYTES>()
-                    .0
-                {
+            // A valid packet CRC locks the tile size and legacy/four-level mode.
+            let candidates: Vec<_> = if let Some(format) = detected_format {
+                vec![format]
+            } else {
+                std::iter::once(DEFAULT_TILE_SIZE)
+                    .chain((2..=10).filter(|&size| size != DEFAULT_TILE_SIZE))
+                    .flat_map(|size| [(size, true), (size, false)])
+                    .collect()
+            };
+            for (tile_size, four_gray) in candidates {
+                let packed = frame_to_packets_sized(&frame, four_gray, tile_size);
+                for packet in packed.as_chunks::<PACKET_BYTES>().0 {
+                    if detected_format.is_none() && parse_packet(packet).is_some() {
+                        detected_format = Some((tile_size, four_gray));
+                    }
                     if decoder.accept(packet) {
                         break;
                     }
                 }
-                if decoder.stopped() {
+                if decoder.stopped() || detected_format.is_some() {
                     break;
                 }
             }
@@ -740,15 +824,45 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct EncodeOptions {
     full_audio: bool,
     color: bool,
+    tile_size: usize,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            full_audio: false,
+            color: false,
+            tile_size: DEFAULT_TILE_SIZE,
+        }
+    }
 }
 
 fn encode_options(flags: &[String]) -> io::Result<EncodeOptions> {
     let mut options = EncodeOptions::default();
-    for flag in flags {
+    let mut flags = flags.iter();
+    let mut tile_size_seen = false;
+    while let Some(flag) = flags.next() {
+        if flag == "--tile-size" || flag.starts_with("--tile-size=") {
+            if tile_size_seen {
+                return Err(io::Error::other("duplicate encode option: --tile-size"));
+            }
+            tile_size_seen = true;
+            let value = if let Some((_, value)) = flag.split_once('=') {
+                value
+            } else {
+                flags.next().map(String::as_str).unwrap_or("")
+            };
+            options.tile_size = value
+                .parse::<usize>()
+                .ok()
+                .filter(|size| (2..=10).contains(size))
+                .ok_or_else(|| io::Error::other("--tile-size requires an integer from 2 to 10"))?;
+            continue;
+        }
         let enabled = match flag.as_str() {
             "--full-audio" => &mut options.full_audio,
             "--color" => &mut options.color,
@@ -765,17 +879,23 @@ fn encode_options(flags: &[String]) -> io::Result<EncodeOptions> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("Usage: bytevideo encode input.bin output.mp4 [--full-audio] [--color]\n       bytevideo decode input.mp4 output.bin");
+        eprintln!("Usage: bytevideo encode input.bin output.mp4 [--full-audio] [--color] [--tile-size 2..10]\n       bytevideo decode input.mp4 output.bin");
         std::process::exit(2);
     }
     match args[1].as_str() {
         "encode" => {
             let options = encode_options(&args[4..])?;
-            encode(&args[2], &args[3], options.full_audio, options.color)
+            encode(
+                &args[2],
+                &args[3],
+                options.full_audio,
+                options.color,
+                options.tile_size,
+            )
         }
         "decode" if args.len() == 4 => decode(&args[2], &args[3]),
         "decode" => Err(io::Error::other(
-            "decode does not accept options; colored videos are decoded automatically",
+            "decode does not accept options; tile size and color are detected automatically",
         )),
         _ => Err(io::Error::other("expected encode or decode")),
     }
@@ -976,6 +1096,89 @@ mod tests {
     }
 
     #[test]
+    fn all_tile_sizes_preserve_data_in_gray_and_color() {
+        for size in 2..=10 {
+            let geometry = TileGeometry::new(size);
+            let packed: Vec<u8> = (0..PACKET_BYTES * geometry.packets_per_frame())
+                .map(|i| (i * 71 + i / 256) as u8)
+                .collect();
+            for color in [false, true] {
+                let mut renderer = FrameRenderer::with_tile_size(color, size);
+                let frame = renderer.render(&packed);
+                let gray: Vec<_> = frame[..FRAME_BYTES]
+                    .iter()
+                    .map(|&y| {
+                        if color {
+                            ((u16::from(y) - 16) * 255 + 109) / 219
+                        } else {
+                            u16::from(y)
+                        }
+                    })
+                    .map(|y| y as u8)
+                    .collect();
+                assert_eq!(
+                    frame_to_packets_sized(&gray, true, size),
+                    packed,
+                    "tile size {size}, color {color}"
+                );
+            }
+            for groups in [1, 3, 8] {
+                let count = geometry.packets_per_frame();
+                let t = timeline_sized(groups, false, count).unwrap();
+                let packets = (groups * SHARDS * COPIES) as u64;
+                assert!(t.frames * count as u64 >= packets);
+                assert!((t.frames - 1) * (count as u64) < packets);
+                assert_eq!(t.samples * FPS as u64, t.frames * audio::RATE as u64);
+                assert_eq!(
+                    timeline_sized(groups, true, count).unwrap().frames,
+                    timeline(groups, true).unwrap().frames
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tile_size_options_validate_values_and_combine_with_flags() {
+        let flags = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for size in 2..=10 {
+            let value = size.to_string();
+            for items in [
+                vec!["--color", "--tile-size", value.as_str(), "--full-audio"],
+                vec!["--tile-size", value.as_str(), "--full-audio", "--color"],
+            ] {
+                assert_eq!(
+                    encode_options(&flags(&items)).unwrap(),
+                    EncodeOptions {
+                        tile_size: size,
+                        color: true,
+                        full_audio: true,
+                    }
+                );
+            }
+            assert_eq!(
+                encode_options(&[format!("--tile-size={size}")])
+                    .unwrap()
+                    .tile_size,
+                size
+            );
+        }
+        for items in [
+            vec!["--tile-size"],
+            vec!["--tile-size="],
+            vec!["--tile-size", "--color"],
+            vec!["--tile-size", "1"],
+            vec!["--tile-size", "11"],
+            vec!["--tile-size", "-1"],
+            vec!["--tile-size", "3.5"],
+            vec!["--tile-size", "abc"],
+            vec!["--tile-size", "999999999999999999999999"],
+            vec!["--tile-size", "3", "--tile-size=4"],
+        ] {
+            assert!(encode_options(&flags(&items)).is_err(), "{items:?}");
+        }
+    }
+
+    #[test]
     fn encode_flags_combine_in_either_order_and_reject_mistakes() {
         let flags = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(encode_options(&[]).unwrap(), EncodeOptions::default());
@@ -984,7 +1187,8 @@ mod tests {
                 encode_options(&flags(&options)).unwrap(),
                 EncodeOptions {
                     color: true,
-                    full_audio: true
+                    full_audio: true,
+                    ..EncodeOptions::default()
                 }
             );
         }
