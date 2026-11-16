@@ -5,11 +5,12 @@ cargo build --release
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 bin=./target/release/bytevideo
+encode_flags=("$@")
 python3 - "$work/input.bin" <<'PY'
 import random, sys
 open(sys.argv[1], 'wb').write(random.Random(42).randbytes(200000))
 PY
-"$bin" encode "$work/input.bin" "$work/original.mp4"
+"$bin" encode "$work/input.bin" "$work/original.mp4" "${encode_flags[@]}"
 python3 - "$work/original.mp4" <<'PY'
 import json, subprocess, sys
 s = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', sys.argv[1]]))['streams']
@@ -53,7 +54,7 @@ ffmpeg -v error -i "$work/original.mp4" \
 cmp "$work/input.bin" "$work/damaged.bin"
 # Tiny input: trimmed zero padding lets useful repair packets fit in 1.2 seconds.
 printf 'test' > "$work/tiny.bin"
-"$bin" encode "$work/tiny.bin" "$work/tiny.mp4"
+"$bin" encode "$work/tiny.bin" "$work/tiny.mp4" "${encode_flags[@]}"
 ffmpeg -v error -i "$work/tiny.mp4" \
   -vf "drawbox=x=0:y=0:w=iw:h=ih/2:color=black:t=fill:enable='eq(mod(n,12),8)',select='gte(mod(n,12),4)',setpts=N/(30*TB)" \
   -fps_mode vfr -c:v libx264 -crf 28 -c:a aac -b:a 128k "$work/tiny-damaged.mp4"

@@ -93,17 +93,53 @@ fn make_shards(data: &[u8]) -> (Metadata, Vec<Vec<Vec<u8>>>) {
     (meta, result)
 }
 
+// Soft RGB tints in YUV: chroma changes the appearance, never the data luma.
+fn tile_chroma(level: u8, hue: usize) -> (u8, u8) {
+    let (u, v) = [(-16i16, 40i16), (-24, -28), (40, -8)][hue];
+    // Reduce saturation near black/white so displayed RGB stays within gamut.
+    let strength = i16::from(level.min(255 - level).min(64));
+    (
+        (128 + u * strength / 96) as u8,
+        (128 + v * strength / 96) as u8,
+    )
+}
+
 // Two ordinary BV02 packets share a frame, with two bits per tile.
-fn packets_to_frame(packets: &[u8]) -> Vec<u8> {
+fn packets_to_frame(packets: &[u8], color: bool) -> Vec<u8> {
     assert_eq!(packets.len(), PACKET_BYTES * PACKETS_PER_FRAME);
-    let mut frame = vec![0u8; FRAME_BYTES];
+    let chroma_bytes = FRAME_BYTES / 4;
+    let mut frame = vec![
+        128u8;
+        if color {
+            FRAME_BYTES + 2 * chroma_bytes
+        } else {
+            FRAME_BYTES
+        }
+    ];
     for tile in 0..COLS * ROWS {
         let symbol = (packets[tile / 4] >> (6 - 2 * (tile % 4))) & 3;
+        let level = GRAY_LEVELS[symbol as usize];
+        // gray input is full-range; yuv420p is limited-range. Match the existing
+        // FFmpeg gray -> YUV mapping so the unchanged decoder sees the same levels.
+        let luma = if color {
+            (16 + (u16::from(level) * 219 + 127) / 255) as u8
+        } else {
+            level
+        };
         let x = (tile % COLS) * TILE;
         let y = (tile / COLS) * TILE;
         for dy in 0..TILE {
-            frame[(y + dy) * WIDTH + x..(y + dy) * WIDTH + x + TILE]
-                .fill(GRAY_LEVELS[symbol as usize]);
+            frame[(y + dy) * WIDTH + x..(y + dy) * WIDTH + x + TILE].fill(luma);
+        }
+        if color {
+            let hue = (tile % COLS + tile / COLS) % 3;
+            let (u, v) = tile_chroma(level, hue);
+            for (plane, value) in [(FRAME_BYTES, u), (FRAME_BYTES + chroma_bytes, v)] {
+                for dy in 0..TILE / 2 {
+                    let start = plane + (y / 2 + dy) * (WIDTH / 2) + x / 2;
+                    frame[start..start + TILE / 2].fill(value);
+                }
+            }
         }
     }
     frame
@@ -304,7 +340,7 @@ fn timeline(groups: usize, full_audio: bool) -> io::Result<Timeline> {
     })
 }
 
-fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
+fn encode(input: &str, output: &str, full_audio: bool, color: bool) -> io::Result<()> {
     let mut prepared = PreparedInput::new(Path::new(input))?;
     let groups = prepared.metadata.groups;
     let size = prepared.metadata.size;
@@ -384,7 +420,7 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
             "-f",
             "rawvideo",
             "-pixel_format",
-            "gray",
+            if color { "yuv420p" } else { "gray" },
             "-video_size",
             "1280x720",
             "-framerate",
@@ -458,7 +494,7 @@ fn encode(input: &str, output: &str, full_audio: bool) -> io::Result<()> {
                     let packet = prepared.packet(group, shard)?;
                     pending.extend_from_slice(&packet);
                     if pending.len() == PACKET_BYTES * PACKETS_PER_FRAME {
-                        pipe.write_all(&packets_to_frame(&pending))?;
+                        pipe.write_all(&packets_to_frame(&pending, color))?;
                         pending.clear();
                     }
                 }
@@ -601,15 +637,43 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EncodeOptions {
+    full_audio: bool,
+    color: bool,
+}
+
+fn encode_options(flags: &[String]) -> io::Result<EncodeOptions> {
+    let mut options = EncodeOptions::default();
+    for flag in flags {
+        let enabled = match flag.as_str() {
+            "--full-audio" => &mut options.full_audio,
+            "--color" => &mut options.color,
+            _ => return Err(io::Error::other(format!("unknown encode option: {flag}"))),
+        };
+        if *enabled {
+            return Err(io::Error::other(format!("duplicate encode option: {flag}")));
+        }
+        *enabled = true;
+    }
+    Ok(options)
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 4 && !(args.len() == 5 && args[1] == "encode" && args[4] == "--full-audio") {
-        eprintln!("Usage: bytevideo encode input.bin output.mp4 [--full-audio]\n       bytevideo decode input.mp4 output.bin");
+    if args.len() < 4 {
+        eprintln!("Usage: bytevideo encode input.bin output.mp4 [--full-audio] [--color]\n       bytevideo decode input.mp4 output.bin");
         std::process::exit(2);
     }
     match args[1].as_str() {
-        "encode" => encode(&args[2], &args[3], args.len() == 5),
-        "decode" => decode(&args[2], &args[3]),
+        "encode" => {
+            let options = encode_options(&args[4..])?;
+            encode(&args[2], &args[3], options.full_audio, options.color)
+        }
+        "decode" if args.len() == 4 => decode(&args[2], &args[3]),
+        "decode" => Err(io::Error::other(
+            "decode does not accept options; colored videos are decoded automatically",
+        )),
         _ => Err(io::Error::other("expected encode or decode")),
     }
 }
@@ -732,10 +796,55 @@ mod tests {
     }
 
     #[test]
+    fn color_preserves_luma_data_and_uses_three_tints() {
+        let packed = vec![0b00011011; PACKET_BYTES * PACKETS_PER_FRAME];
+        let gray = packets_to_frame(&packed, false);
+        let color = packets_to_frame(&packed, true);
+        assert_eq!(color.len(), FRAME_BYTES * 3 / 2);
+        let restored: Vec<u8> = color[..FRAME_BYTES]
+            .iter()
+            .map(|&y| ((u16::from(y) - 16) * 255 + 109).div_euclid(219) as u8)
+            .collect();
+        assert_eq!(frame_to_packets(&restored, true), packed);
+        for (expected, actual) in gray.iter().zip(&restored) {
+            assert!(expected.abs_diff(*actual) <= 1);
+        }
+        for tile in 0..12 {
+            let level = GRAY_LEVELS[tile % 4];
+            let hue = tile % 3;
+            let (u, v) = tile_chroma(level, hue);
+            assert_eq!(color[FRAME_BYTES + tile * TILE / 2], u);
+            assert_eq!(color[FRAME_BYTES + FRAME_BYTES / 4 + tile * TILE / 2], v);
+            match hue {
+                0 => assert!(u < 128 && v > 128),
+                1 => assert!(u < 128 && v < 128),
+                _ => assert!(u > 128 && v < 128),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_flags_combine_in_either_order_and_reject_mistakes() {
+        let flags = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(encode_options(&[]).unwrap(), EncodeOptions::default());
+        for options in [["--color", "--full-audio"], ["--full-audio", "--color"]] {
+            assert_eq!(
+                encode_options(&flags(&options)).unwrap(),
+                EncodeOptions {
+                    color: true,
+                    full_audio: true
+                }
+            );
+        }
+        assert!(encode_options(&flags(&["--colour"])).is_err());
+        assert!(encode_options(&flags(&["--color", "--color"])).is_err());
+    }
+
+    #[test]
     fn four_gray_levels_and_brightness_tolerance() {
         // 00, 01, 10, 11 in every byte exercises all four levels equally.
         let packed = vec![0b00011011; PACKET_BYTES * PACKETS_PER_FRAME];
-        let frame = packets_to_frame(&packed);
+        let frame = packets_to_frame(&packed, false);
         for (tile, level) in GRAY_LEVELS.iter().enumerate() {
             assert_eq!(frame[tile * TILE], *level);
         }
@@ -779,7 +888,7 @@ mod tests {
         let packet = make_packet(0, &meta, &groups[0][0]);
         let second = make_packet(1, &meta, &groups[0][1]);
         let packed = [packet.clone(), second].concat();
-        let mut frame = packets_to_frame(&packed);
+        let mut frame = packets_to_frame(&packed, false);
         // Change one center pixel in every tile; the average still identifies the two-bit symbol.
         for y in 0..ROWS {
             for x in 0..COLS {
