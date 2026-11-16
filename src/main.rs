@@ -104,8 +104,110 @@ fn tile_chroma(level: u8, hue: usize) -> (u8, u8) {
     )
 }
 
-// Two ordinary BV02 packets share a frame, with two bits per tile.
+// A byte covers four tiles. Precompute their row bytes for every starting hue
+// and data value, then copy those rows into one reusable frame buffer.
+struct BytePattern {
+    y: [u8; TILE * 4],
+    u: [u8; TILE * 2],
+    v: [u8; TILE * 2],
+}
+
+struct ByteLayout {
+    y: usize,
+    uv: usize,
+    palette: usize,
+}
+
+struct FrameRenderer {
+    color: bool,
+    patterns: Vec<BytePattern>,
+    layouts: Vec<ByteLayout>,
+    frame: Vec<u8>,
+}
+
+impl FrameRenderer {
+    fn new(color: bool) -> Self {
+        let hues = if color { 3 } else { 1 };
+        let mut patterns = Vec::with_capacity(hues * 256);
+        for hue in 0..hues {
+            for byte in 0..256u16 {
+                let mut pattern = BytePattern {
+                    y: [0; TILE * 4],
+                    u: [128; TILE * 2],
+                    v: [128; TILE * 2],
+                };
+                for tile in 0..4 {
+                    let symbol = (byte >> (6 - 2 * tile)) & 3;
+                    let level = GRAY_LEVELS[symbol as usize];
+                    // Match FFmpeg's full-range gray -> limited-range YUV mapping.
+                    let luma = if color {
+                        (16 + (u16::from(level) * 219 + 127) / 255) as u8
+                    } else {
+                        level
+                    };
+                    pattern.y[tile * TILE..(tile + 1) * TILE].fill(luma);
+                    if color {
+                        let (u, v) = tile_chroma(level, (hue + tile) % 3);
+                        pattern.u[tile * TILE / 2..(tile + 1) * TILE / 2].fill(u);
+                        pattern.v[tile * TILE / 2..(tile + 1) * TILE / 2].fill(v);
+                    }
+                }
+                patterns.push(pattern);
+            }
+        }
+        let layouts = (0..PACKET_BYTES * PACKETS_PER_FRAME)
+            .map(|byte| {
+                let row = byte / (COLS / 4);
+                let column = byte % (COLS / 4) * 4;
+                ByteLayout {
+                    y: row * TILE * WIDTH + column * TILE,
+                    uv: row * (TILE / 2) * (WIDTH / 2) + column * TILE / 2,
+                    palette: if color { ((column + row) % 3) * 256 } else { 0 },
+                }
+            })
+            .collect();
+        let bytes = if color {
+            FRAME_BYTES * 3 / 2
+        } else {
+            FRAME_BYTES
+        };
+        Self {
+            color,
+            patterns,
+            layouts,
+            frame: vec![0; bytes],
+        }
+    }
+
+    fn render(&mut self, packets: &[u8]) -> &[u8] {
+        assert_eq!(packets.len(), self.layouts.len());
+        for (&byte, layout) in packets.iter().zip(&self.layouts) {
+            let pattern = &self.patterns[layout.palette + byte as usize];
+            for dy in 0..TILE {
+                let start = layout.y + dy * WIDTH;
+                self.frame[start..start + TILE * 4].copy_from_slice(&pattern.y);
+            }
+            if self.color {
+                for dy in 0..TILE / 2 {
+                    let start = FRAME_BYTES + layout.uv + dy * (WIDTH / 2);
+                    self.frame[start..start + TILE * 2].copy_from_slice(&pattern.u);
+                    let start = start + FRAME_BYTES / 4;
+                    self.frame[start..start + TILE * 2].copy_from_slice(&pattern.v);
+                }
+            }
+        }
+        &self.frame
+    }
+}
+
+#[cfg(test)]
 fn packets_to_frame(packets: &[u8], color: bool) -> Vec<u8> {
+    FrameRenderer::new(color).render(packets).to_vec()
+}
+
+// Two ordinary BV02 packets share a frame, with two bits per tile.
+#[cfg(test)]
+fn reference_frame(packets: &[u8], color: bool) -> Vec<u8> {
     assert_eq!(packets.len(), PACKET_BYTES * PACKETS_PER_FRAME);
     let chroma_bytes = FRAME_BYTES / 4;
     let mut frame = vec![
@@ -488,13 +590,14 @@ fn encode(input: &str, output: &str, full_audio: bool, color: bool) -> io::Resul
         // Send the same shard position from each group before the next position.
         // Copies are separate passes, so a short burst cannot erase all copies.
         let mut pending = Vec::with_capacity(PACKET_BYTES * PACKETS_PER_FRAME);
+        let mut renderer = FrameRenderer::new(color);
         for _ in 0..COPIES {
             for shard in 0..SHARDS {
                 for group in 0..groups {
                     let packet = prepared.packet(group, shard)?;
                     pending.extend_from_slice(&packet);
                     if pending.len() == PACKET_BYTES * PACKETS_PER_FRAME {
-                        pipe.write_all(&packets_to_frame(&pending, color))?;
+                        pipe.write_all(renderer.render(&pending))?;
                         pending.clear();
                     }
                 }
@@ -793,6 +896,55 @@ mod tests {
     fn empty_file_roundtrip() {
         let (meta, packets) = packets(b"");
         assert_eq!(recover(&meta, &packets).unwrap(), b"");
+    }
+
+    #[test]
+    fn renderer_matches_original_bytes_and_reuses_its_buffer() {
+        for color in [false, true] {
+            let mut renderer = FrameRenderer::new(color);
+            let address = renderer.frame.as_ptr();
+            let capacity = renderer.frame.capacity();
+            for phase in [0usize, 1, 83, 255] {
+                let packed: Vec<u8> = (0..PACKET_BYTES * PACKETS_PER_FRAME)
+                    .map(|i| (i * 71 + phase) as u8)
+                    .collect();
+                assert_eq!(renderer.render(&packed), reference_frame(&packed, color));
+                assert_eq!(renderer.frame.as_ptr(), address);
+                assert_eq!(renderer.frame.capacity(), capacity);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual frame rendering benchmark, excludes FFmpeg"]
+    fn render_benchmark() {
+        use std::hint::black_box;
+        let frames: usize = env::var("RENDER_FRAMES")
+            .unwrap_or_else(|_| "5000".into())
+            .parse()
+            .unwrap();
+        let reuse = env::var("RENDER_MODE").unwrap() == "reuse";
+        let color = env::var("RENDER_COLOR").unwrap_or_else(|_| "1".into()) == "1";
+        let mut packets: Vec<u8> = (0..PACKET_BYTES * PACKETS_PER_FRAME)
+            .map(|i| (i * 71) as u8)
+            .collect();
+        let mut renderer = FrameRenderer::new(color);
+        let started = std::time::Instant::now();
+        for i in 0..frames {
+            packets[0] = i as u8;
+            if reuse {
+                black_box(renderer.render(black_box(&packets)));
+            } else {
+                black_box(reference_frame(black_box(&packets), color));
+            }
+        }
+        println!(
+            "render mode={} color={} frames={} seconds={:.6}",
+            if reuse { "reuse" } else { "reference" },
+            color,
+            frames,
+            started.elapsed().as_secs_f64()
+        );
     }
 
     #[test]
