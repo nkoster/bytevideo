@@ -5,7 +5,8 @@ cargo build --release
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 bin=./target/release/bytevideo
-encode_flags=("$@")
+# This suite deliberately exercises the original four-level packet layout.
+encode_flags=(--gray-levels 4 "$@")
 python3 - "$work/input.bin" <<'PY'
 import random, sys
 open(sys.argv[1], 'wb').write(random.Random(42).randbytes(200000))

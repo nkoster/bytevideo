@@ -7,6 +7,15 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 pub const BYTES: usize = 256;
 const HEADER: usize = 18;
 const PAYLOAD: usize = BYTES - HEADER;
+pub const FULL_PARTS: usize = PACKET_BYTES.div_ceil(PAYLOAD);
+
+pub fn full_fragments(index: u32, packet: &[u8]) -> Vec<Vec<u8>> {
+    split(index, packet, packet.len())
+}
+
+pub fn valid_fragment(fragment: &[u8]) -> bool {
+    parse_fragment(fragment).is_some()
+}
 
 pub fn fragments(index: u32, packet: &[u8]) -> Vec<Vec<u8>> {
     // Padding is deterministic. Omitting it makes audio useful for tiny files too.
@@ -15,6 +24,10 @@ pub fn fragments(index: u32, packet: &[u8]) -> Vec<Vec<u8>> {
         .rposition(|&b| b != 0)
         .map_or(0, |i| i + 1)
         .max(crate::HEADER_BYTES);
+    split(index, packet, len)
+}
+
+fn split(index: u32, packet: &[u8], len: usize) -> Vec<Vec<u8>> {
     let total = len.div_ceil(PAYLOAD);
     packet[..len]
         .chunks(PAYLOAD)
