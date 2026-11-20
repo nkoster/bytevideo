@@ -10,6 +10,8 @@ By default, it uses two grayscale levels and 8×8-pixel tiles. You can experimen
 
 Install Rust and FFmpeg with the libx264 encoder and AAC support. The integration tests also require `ffprobe` and Python 3.
 
+FFmpeg 4.4 is supported. When FFmpeg provides `-movie_timescale`, bytevideo uses it for sample-exact MP4 track durations; older versions use the default movie clock, which can round audio edit durations to milliseconds.
+
 ```sh
 cargo build --release
 ```
@@ -110,7 +112,7 @@ The encoder prioritizes parity shards and only sends packets whose complete frag
 
 `--full-audio` writes a complete audio pass of all data and parity shards. Video packets are held and distributed throughout the entire audio duration. One group takes 173.600 seconds; either channel can recover the file independently when enough valid shards survive. The decoder stops early when video alone suffices.
 
-Timing uses integer audio sample and video frame counts. Full mode pads audio to a 30 fps frame boundary; the MP4 movie clock runs at 48 kHz to avoid millisecond rounding of AAC edit durations. With the default settings, fast mode uses exactly 72 frames per group and pads unused audio time with silence. Audio and video are aligned to the same end time.
+Timing uses integer audio sample and video frame counts. Full mode pads audio to a 30 fps frame boundary; when supported by FFmpeg, the MP4 movie clock runs at 48 kHz to avoid millisecond rounding of AAC edit durations. With the default settings, fast mode uses exactly 72 frames per group and pads unused audio time with silence. Audio and video are aligned to the same end time, subject to millisecond rounding on older FFmpeg versions.
 
 ### Decoding and supported formats
 

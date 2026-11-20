@@ -30,14 +30,14 @@ cmp "$work/input.bin" "$work/plain.bin"
 rg -q '64 video frames read; audio skipped' "$work/decode.log"
 # Remove all copies of eight shard positions in all eight groups; video alone suffices.
 ffmpeg -v error -i "$work/original.mp4" -vf "select='gte(mod(n,96),32)',setpts=N/(30*TB)" \
-  -fps_mode vfr -an -c:v libx264 -crf 28 "$work/dropped.mp4"
+  -vsync vfr -an -c:v libx264 -crf 28 "$work/dropped.mp4"
 "$bin" decode "$work/dropped.mp4" "$work/dropped.bin"
 cmp "$work/input.bin" "$work/dropped.bin"
 # Nine missing shards in group zero, eight elsewhere: video alone fails.
 # Compact audio supplies parity shard 16 of group zero and makes recovery possible.
 ffmpeg -v error -i "$work/original.mp4" \
   -vf "drawbox=x=0:y=0:w=iw:h=ih/2:color=black:t=fill:enable='eq(mod(n,96),64)',select='gte(mod(n,96),32)',setpts=N/(30*TB)" \
-  -fps_mode vfr -an -c:v libx264 -crf 28 "$work/insufficient.mp4"
+  -vsync vfr -an -c:v libx264 -crf 28 "$work/insufficient.mp4"
 if "$bin" decode "$work/insufficient.mp4" "$work/must-not-exist.bin"; then
   echo 'Expected recovery to fail' >&2; exit 1
 fi
@@ -58,7 +58,7 @@ printf 'test' > "$work/tiny.bin"
 "$bin" encode "$work/tiny.bin" "$work/tiny.mp4" "${encode_flags[@]}"
 ffmpeg -v error -i "$work/tiny.mp4" \
   -vf "drawbox=x=0:y=0:w=iw:h=ih/2:color=black:t=fill:enable='eq(mod(n,12),8)',select='gte(mod(n,12),4)',setpts=N/(30*TB)" \
-  -fps_mode vfr -c:v libx264 -crf 28 -c:a aac -b:a 128k "$work/tiny-damaged.mp4"
+  -vsync vfr -c:v libx264 -crf 28 -c:a aac -b:a 128k "$work/tiny-damaged.mp4"
 "$bin" decode "$work/tiny-damaged.mp4" "$work/tiny-recovered.bin"
 cmp "$work/tiny.bin" "$work/tiny-recovered.bin"
 # Both operations preserve an existing destination if recovery/FFmpeg fails.
@@ -71,6 +71,9 @@ cmp "$work/expected-existing.bin" "$work/existing.bin"
 mkdir "$work/fakebin" "$work/tmp"
 cat > "$work/fakebin/ffmpeg" <<'SH'
 #!/usr/bin/env bash
+if [[ "$*" == '-hide_banner -h muxer=mp4' ]]; then
+  exit 0
+fi
 # Simulate FFmpeg failing after creating an incomplete output.
 for output do :; done
 printf 'partial MP4' > "$output"

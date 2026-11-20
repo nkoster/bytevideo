@@ -680,7 +680,22 @@ fn encode(
     }
     let video_workspace = Workspace::beside(Path::new(output))?;
     let staged_video = video_workspace.0.join("video.mp4");
-    let mut child = Command::new("ffmpeg")
+    // Probe capabilities rather than versions, which may contain backports.
+    let muxer_help = Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "muxer=mp4"])
+        .output()?;
+    if !muxer_help.status.success() {
+        return Err(io::Error::other("ffmpeg MP4 capability check failed"));
+    }
+    let mut command = Command::new("ffmpeg");
+    if String::from_utf8_lossy(&muxer_help.stdout)
+        .split_whitespace()
+        .any(|word| word == "-movie_timescale")
+    {
+        // Avoid millisecond rounding of AAC edit durations when supported.
+        command.args(["-movie_timescale", &audio::RATE.to_string()]);
+    }
+    let mut child = command
         .args([
             "-nostdin",
             "-y",
@@ -727,10 +742,6 @@ fn encode(
             &crf,
             "-pix_fmt",
             "yuv420p",
-            // MP4's default 1 kHz movie clock rounds AAC edit durations to
-            // milliseconds. Use the audio clock so both tracks end sample-exact.
-            "-movie_timescale",
-            &audio::RATE.to_string(),
             "-movflags",
             "+faststart",
             staged_video
@@ -821,8 +832,9 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
             "-map",
             "0:v:0",
             "-an",
-            "-fps_mode",
-            "passthrough",
+            // Equivalent to -fps_mode passthrough, including on FFmpeg 4.4.
+            "-vsync",
+            "0",
             "-vf",
             "scale=1280:720",
             "-f",
