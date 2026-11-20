@@ -687,67 +687,66 @@ fn encode(
     if !muxer_help.status.success() {
         return Err(io::Error::other("ffmpeg MP4 capability check failed"));
     }
-    let mut command = Command::new("ffmpeg");
-    if String::from_utf8_lossy(&muxer_help.stdout)
+    let supports_movie_timescale = String::from_utf8_lossy(&muxer_help.stdout)
         .split_whitespace()
-        .any(|word| word == "-movie_timescale")
-    {
-        // Avoid millisecond rounding of AAC edit durations when supported.
+        .any(|word| word == "-movie_timescale");
+    let mut command = Command::new("ffmpeg");
+    command.args([
+        "-nostdin",
+        "-y",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-v",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        if color { "yuv420p" } else { "gray" },
+        "-video_size",
+        "1280x720",
+        "-framerate",
+        &input_rate,
+        "-i",
+        "-",
+        "-f",
+        "f32le",
+        "-ar",
+        &audio::RATE.to_string(),
+        "-ac",
+        "1",
+        "-i",
+        audio_path
+            .to_str()
+            .ok_or_else(|| io::Error::other("invalid temporary path"))?,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-vf",
+        &video_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        &crf,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+    ]);
+    if supports_movie_timescale {
+        // This MP4 output option must follow all inputs. Avoid millisecond
+        // rounding of AAC edit durations when supported.
         command.args(["-movie_timescale", &audio::RATE.to_string()]);
     }
     let mut child = command
-        .args([
-            "-nostdin",
-            "-y",
-            "-nostats",
-            "-progress",
-            "pipe:1",
-            "-v",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            if color { "yuv420p" } else { "gray" },
-            "-video_size",
-            "1280x720",
-            "-framerate",
-            &input_rate,
-            "-i",
-            "-",
-            "-f",
-            "f32le",
-            "-ar",
-            &audio::RATE.to_string(),
-            "-ac",
-            "1",
-            "-i",
-            audio_path
-                .to_str()
-                .ok_or_else(|| io::Error::other("invalid temporary path"))?,
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-vf",
-            &video_filter,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            &crf,
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            staged_video
-                .to_str()
-                .ok_or_else(|| io::Error::other("invalid output path"))?,
-        ])
+        .arg(&staged_video)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
