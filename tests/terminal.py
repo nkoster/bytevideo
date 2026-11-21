@@ -52,9 +52,16 @@ with tempfile.TemporaryDirectory(prefix="bytevideo-terminal-") as directory:
     work = Path(directory)
     source = work / "input.bin"
     source.write_bytes(b"terminal echo regression")
-    video = work / "video.mp4"
-    run_in_terminal(["encode", source, video])
+    # Exercise the default ten-level layout before the binary audio fixture.
+    default_video = work / "default.mp4"
     restored = work / "restored.bin"
+    run_in_terminal(["encode", source, default_video])
+    log = run_in_terminal(["decode", default_video, restored])
+    assert "audio skipped" in log, log
+    assert restored.read_bytes() == source.read_bytes()
+    # Pin two levels: the damage pattern below assumes one packet per frame.
+    video = work / "video.mp4"
+    run_in_terminal(["encode", source, video, "--gray-levels", "2"])
     log = run_in_terminal(["decode", video, restored])
     assert "16 video frames read; audio skipped" in log, log
     assert restored.read_bytes() == source.read_bytes()

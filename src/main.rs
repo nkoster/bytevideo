@@ -101,9 +101,41 @@ fn make_shards(data: &[u8]) -> (Metadata, Vec<Vec<Vec<u8>>>) {
     (meta, result)
 }
 
-// Soft Rasta tints (red, yellow, green) in YUV: chroma never changes data luma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorMode {
+    Gray,
+    Rasta,
+    Red,
+    Green,
+    Blue,
+}
+
+impl ColorMode {
+    fn hue(self, position: usize, levels: usize) -> usize {
+        match self {
+            Self::Red => 0,
+            Self::Green => 2,
+            Self::Blue => 3,
+            _ => color_hue(position, levels),
+        }
+    }
+
+    fn parse(name: &str) -> io::Result<Self> {
+        match name {
+            "rasta" => Ok(Self::Rasta),
+            "red" => Ok(Self::Red),
+            "green" => Ok(Self::Green),
+            "blue" => Ok(Self::Blue),
+            _ => Err(io::Error::other(
+                "--color accepts red, green, blue or rasta",
+            )),
+        }
+    }
+}
+
+// Soft tints (red, yellow, green, blue) in YUV: chroma never changes data luma.
 fn tile_chroma(level: u8, hue: usize) -> (u8, u8) {
-    let (u, v) = [(-16i16, 40i16), (-40, 8), (-24, -28)][hue];
+    let (u, v) = [(-16i16, 40i16), (-40, 8), (-24, -28), (40, -16)][hue];
     // Reduce saturation near black/white so displayed RGB stays within gamut.
     let strength = i16::from(level.min(255 - level).min(64));
     (
@@ -214,9 +246,23 @@ impl FrameRenderer {
         Self::with_levels(color, tile_size, 4)
     }
 
+    #[cfg(test)]
     fn with_levels(color: bool, tile_size: usize, levels: usize) -> Self {
+        Self::with_mode(
+            if color {
+                ColorMode::Rasta
+            } else {
+                ColorMode::Gray
+            },
+            tile_size,
+            levels,
+        )
+    }
+
+    fn with_mode(mode: ColorMode, tile_size: usize, levels: usize) -> Self {
+        let color = mode != ColorMode::Gray;
         let geometry = TileGeometry::with_levels(tile_size, levels);
-        let hues = if !color {
+        let hues = if mode != ColorMode::Rasta {
             1
         } else if levels == 2 {
             2
@@ -246,7 +292,7 @@ impl FrameRenderer {
                         };
                         pattern.y[tile * tile_size..(tile + 1) * tile_size].fill(luma);
                         if color {
-                            let (u, v) = tile_chroma(level, color_hue(hue + tile, levels));
+                            let (u, v) = tile_chroma(level, mode.hue(hue + tile, levels));
                             let start = (phase + tile * tile_size).div_ceil(2) - phase.div_ceil(2);
                             let end =
                                 (phase + (tile + 1) * tile_size).div_ceil(2) - phase.div_ceil(2);
@@ -598,10 +644,11 @@ fn encode(
     input: &str,
     output: &str,
     full_audio: bool,
-    color: bool,
+    mode: ColorMode,
     tile_size: usize,
     gray_levels: usize,
 ) -> io::Result<()> {
+    let color = mode != ColorMode::Gray;
     let geometry = TileGeometry::with_levels(tile_size, gray_levels);
     let dense =
         packed::Layout::enabled(gray_levels).then(|| packed::Layout::new(tile_size, gray_levels));
@@ -793,8 +840,8 @@ fn encode(
         let mut pending = Vec::with_capacity(geometry.unit_bytes() * units_per_frame);
         let mut renderer = dense
             .is_none()
-            .then(|| FrameRenderer::with_levels(color, tile_size, gray_levels));
-        let mut dense_renderer = dense.map(|layout| packed::Renderer::new(layout, color));
+            .then(|| FrameRenderer::with_mode(mode, tile_size, gray_levels));
+        let mut dense_renderer = dense.map(|layout| packed::Renderer::with_mode(layout, mode));
         let mut packer = dense.map(packed::Packer::new);
         for _ in 0..COPIES {
             for shard in 0..SHARDS {
@@ -1002,7 +1049,7 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 struct EncodeOptions {
     full_audio: bool,
-    color: bool,
+    color: ColorMode,
     tile_size: usize,
     gray_levels: usize,
 }
@@ -1011,16 +1058,16 @@ impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
             full_audio: false,
-            color: false,
+            color: ColorMode::Gray,
             tile_size: DEFAULT_TILE_SIZE,
-            gray_levels: 2,
+            gray_levels: 10,
         }
     }
 }
 
 fn encode_options(flags: &[String]) -> io::Result<EncodeOptions> {
     let mut options = EncodeOptions::default();
-    let mut flags = flags.iter();
+    let mut flags = flags.iter().peekable();
     let mut tile_size_seen = false;
     let mut gray_levels_seen = false;
     while let Some(flag) = flags.next() {
@@ -1060,9 +1107,21 @@ fn encode_options(flags: &[String]) -> io::Result<EncodeOptions> {
                 })?;
             continue;
         }
+        if flag == "--color" || flag.starts_with("--color=") {
+            if options.color != ColorMode::Gray {
+                return Err(io::Error::other("duplicate encode option: --color"));
+            }
+            options.color = if let Some((_, name)) = flag.split_once('=') {
+                ColorMode::parse(name)?
+            } else if flags.peek().is_some_and(|value| !value.starts_with('-')) {
+                ColorMode::parse(flags.next().unwrap())?
+            } else {
+                ColorMode::Rasta
+            };
+            continue;
+        }
         let enabled = match flag.as_str() {
             "--full-audio" => &mut options.full_audio,
-            "--color" => &mut options.color,
             _ => return Err(io::Error::other(format!("unknown encode option: {flag}"))),
         };
         if *enabled {
@@ -1076,7 +1135,7 @@ fn encode_options(flags: &[String]) -> io::Result<EncodeOptions> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("Usage: bytevideo encode input.bin output.mp4 [--full-audio] [--color] [--tile-size 2..10] [--gray-levels 2..10]\n       bytevideo decode input.mp4 output.bin");
+        eprintln!("Usage: bytevideo encode input.bin output.mp4 [--full-audio] [--color [red|green|blue|rasta]] [--tile-size 2..10] [--gray-levels 2..10]\n       bytevideo decode input.mp4 output.bin");
         std::process::exit(2);
     }
     match args[1].as_str() {
@@ -1402,7 +1461,7 @@ mod tests {
 
     #[test]
     fn gray_levels_options_validate_and_combine() {
-        assert_eq!(EncodeOptions::default().gray_levels, 2);
+        assert_eq!(EncodeOptions::default().gray_levels, 10);
         let flags = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for levels in 2..=10 {
             let value = levels.to_string();
@@ -1428,7 +1487,7 @@ mod tests {
                     encode_options(&flags(&items)).unwrap(),
                     EncodeOptions {
                         full_audio: true,
-                        color: true,
+                        color: ColorMode::Rasta,
                         tile_size: 3,
                         gray_levels: levels,
                     }
@@ -1470,7 +1529,7 @@ mod tests {
                     encode_options(&flags(&items)).unwrap(),
                     EncodeOptions {
                         tile_size: size,
-                        color: true,
+                        color: ColorMode::Rasta,
                         full_audio: true,
                         ..EncodeOptions::default()
                     }
@@ -1507,7 +1566,7 @@ mod tests {
             assert_eq!(
                 encode_options(&flags(&options)).unwrap(),
                 EncodeOptions {
-                    color: true,
+                    color: ColorMode::Rasta,
                     full_audio: true,
                     ..EncodeOptions::default()
                 }
@@ -1515,6 +1574,57 @@ mod tests {
         }
         assert!(encode_options(&flags(&["--colour"])).is_err());
         assert!(encode_options(&flags(&["--color", "--color"])).is_err());
+    }
+
+    #[test]
+    fn named_colors_combine_with_transport_options_and_reject_invalid_values() {
+        for (name, mode) in [
+            ("red", ColorMode::Red),
+            ("green", ColorMode::Green),
+            ("blue", ColorMode::Blue),
+            ("rasta", ColorMode::Rasta),
+        ] {
+            let equals = format!("--color={name}");
+            for flags in [
+                vec![
+                    "--color",
+                    name,
+                    "--full-audio",
+                    "--gray-levels=10",
+                    "--tile-size=5",
+                ],
+                vec![
+                    "--tile-size=5",
+                    "--gray-levels=10",
+                    "--full-audio",
+                    "--color",
+                    name,
+                ],
+                vec![&equals, "--gray-levels=10", "--tile-size=5", "--full-audio"],
+            ] {
+                let flags: Vec<_> = flags.into_iter().map(String::from).collect();
+                assert_eq!(
+                    encode_options(&flags).unwrap(),
+                    EncodeOptions {
+                        color: mode,
+                        full_audio: true,
+                        gray_levels: 10,
+                        tile_size: 5,
+                    }
+                );
+            }
+        }
+        for flags in [
+            vec!["--red"],
+            vec!["--color="],
+            vec!["--color", "cyan"],
+            vec!["--color=purple"],
+            vec!["--color", "red", "--color", "green"],
+            vec!["--color", "--color=blue"],
+        ] {
+            let flags: Vec<_> = flags.into_iter().map(String::from).collect();
+            assert!(encode_options(&flags).is_err());
+        }
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 bytevideo stores files in a video and recovers the original bytes from that recording. It turns data into a mosaic of brightness tiles in an H.264 MP4, with additional recovery data in the audio track. Any file can be used as input; its contents are encoded as data.
 
-By default, it uses two grayscale levels and 8×8-pixel tiles. You can experiment with smaller tiles, up to ten brightness levels, decorative colors, or a complete audio backup. Recovery is checked against the original file's SHA-256 before the output is written.
+By default, it uses ten grayscale levels and 8×8-pixel tiles. You can experiment with fewer brightness levels, smaller tiles, decorative colors, or a complete audio backup. Use `--gray-levels 2` for the original two-level encoding. Recovery is checked against the original file's SHA-256 before the output is written.
+
+Observed YouTube results with ten grayscale levels: YouTube's compression reduced an MP4 from 799 MB to approximately 207 MB. The downloaded version decoded successfully, recovering the original data intact despite the recompression.
 
 ## Usage
 
@@ -43,16 +45,19 @@ Place options after the output filename. They can be combined in any order. Valu
 | Option | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `--tile-size N` | 2–10 | 8 | Sets the width and height of each square tile in pixels. |
-| `--gray-levels N` | 2–10 | 2 | Sets the number of brightness levels used for data. |
-| `--color` | Flag | Off | Uses red/green tints at two levels, or red/yellow/green at 3–10 levels. |
+| `--gray-levels N` | 2–10 | 10 | Sets the number of brightness levels used for data. |
+| `--color [NAME]` | `red`, `green`, `blue`, `rasta` | Off | Uses one tint, or the Rasta pattern when no name is given. Also accepts `--color=NAME`. |
 | `--full-audio` | Flag | Off | Adds a complete audio backup and extends the recording to fit it. |
 
 ```sh
-# Default two levels, with red/green tiles.
+# Default ten levels, with red/yellow/green tiles.
 ./target/release/bytevideo encode input.bin colorful.mp4 --color
 
 # Four brightness levels, with red/yellow/green tiles.
 ./target/release/bytevideo encode input.bin four-levels.mp4 --gray-levels 4 --color
+
+# Ten brightness levels, with only red tints.
+./target/release/bytevideo encode input.bin red.mp4 --gray-levels 10 --color red
 
 # Smaller tiles for roundtrip experiments.
 ./target/release/bytevideo encode input.bin tiles3.mp4 --tile-size 3
@@ -76,13 +81,13 @@ For a YouTube roundtrip, test a processed YouTube rendition rather than the orig
 
 ### Video format and error recovery
 
-With the default settings, each frame contains one ordinary BV02 packet, with a 64-byte header and a 1,736-byte shard. Tiles are 8×8 pixels; decoding averages their central 4×4 pixels. Each group contains 16 data shards and 8 Reed-Solomon parity shards. Any 16 valid distinct shards in a group suffice for reconstruction. Three interleaved passes separate packet copies in time. Packet CRC32 detects damage; the original file's SHA-256 must match before output is written.
+With the default settings, each frame has 5,929 bytes of transport capacity, filled with BV02 packets and fragments. Each ordinary BV02 packet has a 64-byte header and a 1,736-byte shard. Tiles are 8×8 pixels; decoding averages their central 4×4 pixels. Each group contains 16 data shards and 8 Reed-Solomon parity shards. Any 16 valid distinct shards in a group suffice for reconstruction. Three interleaved passes separate packet copies in time. Packet CRC32 detects damage; the original file's SHA-256 must match before output is written.
 
-Video determines the duration: with the default two levels and 8×8 tiles, 2.4 seconds per group of up to 27,776 input bytes, or 9.6 seconds for 100,000 bytes. `--gray-levels 4` carries two bits per tile, halving those durations. Both tracks start at zero and end together. H.264 uses CRF 16 at 2–4 levels (higher quality at 5–10 levels), the `veryfast` preset, 1280×720 resolution and constant 30 fps.
+Video determines the duration: with the default ten levels and 8×8 tiles, one group of up to 27,776 input bytes takes 23 frames (0.767 seconds); 100,000 bytes takes 91 frames (3.033 seconds). Exact duration depends on packet and fragment placement. Two levels take 2.4 seconds per group; four levels take 1.2 seconds. Both tracks start at zero and end together. H.264 uses CRF 16 at 2–4 levels (higher quality at 5–10 levels), the `veryfast` preset, 1280×720 resolution and constant 30 fps.
 
 ### Brightness encoding
 
-Brightness levels are evenly spaced from 16 to 235. The default two levels are 16 and 235; four levels use 16, 89, 162 and 235.
+Brightness levels are evenly spaced from 16 to 235. The default uses ten levels. Two levels use 16 and 235; four levels use 16, 89, 162 and 235.
 
 Two and four levels retain their exact bit mappings: eight or four tiles per byte. Other level counts automatically select the most efficient radix block of one to seven bytes, preferring smaller blocks when efficiency is equal. Blocks can cross tile rows. For example, ten levels encode seven bytes in seventeen tiles instead of twenty-one; eight levels encode three bytes in eight tiles. This uses more of the available brightness combinations. For 5–10 levels, the encoder reduces CRF by two per added level (14 down to 4) to preserve the closer brightness values in the generated MP4. This can increase file size. Closer brightness levels are more vulnerable to recompression; local recovery does not guarantee a YouTube roundtrip.
 
@@ -98,7 +103,7 @@ MP4 size does **not** decrease steadily with tile size. The encoder uses a quali
 
 ### Color rendering
 
-`--color` adds a fixed red/green pattern for two levels, or a red/yellow/green Rasta pattern for 3–10 levels. Each hue has the selected number of brightness variants; saturation is lower near black and white. Data uses luma, mapped to limited-range YUV to match ordinary gray-input conversion. Output remains H.264 YUV420p. Packet layout, capacity, timing and redundancy are the same with and without color for the same tile size and gray-level count.
+`--color` adds a fixed red/green pattern for two levels, or a red/yellow/green Rasta pattern for 3–10 levels. `--color red`, `--color green` and `--color blue` use the same coloring process with only the selected hue. `--color rasta` explicitly selects the multicolor pattern. Each hue has the selected number of brightness variants; saturation is lower near black and white. Data uses luma, mapped to limited-range YUV to match ordinary gray-input conversion. Output remains H.264 YUV420p. Packet layout, capacity, timing and redundancy are the same with and without color for the same tile size and gray-level count.
 
 At two and four levels, the renderer precomputes tile-row patterns for all data bytes and starting hues. Other level counts render radix blocks across the tile grid. Both reuse one frame buffer throughout encoding. Run `python3 tests/render_benchmark.py` to measure rendering speed without FFmpeg; this does not measure the complete encode speed.
 
@@ -108,13 +113,13 @@ Chroma adds encoding work and can increase MP4 size. Tests cover video-only reco
 
 Audio supplies additional copies of selected shards within the video duration. The transport uses 2/4 kHz binary FSK at 2,000 bits/s, 48 kHz sampling, and mono AAC at 192 kbit/s. CRC-protected BVA1 fragments contain 238 bytes of packet data each. Deterministic trailing zero padding is omitted, so tiny files can also receive useful audio repair. Fragments are reassembled and checked against the embedded BV02 packet CRC before entering the ordinary recovery process.
 
-The encoder prioritizes parity shards and only sends packets whose complete fragment set fits in the available audio budget. A fragment lasts 1.056 seconds; a full-size shard requires eight fragments. With the default settings, a single full-size shard therefore fits starting at four groups (9.6 seconds). Tiny, mostly padded packets often fit in a single fragment. If no complete repair packet fits, the audio track is silence. Audio is supplemental: fast mode does not promise independent audio-only recovery or an additional parity allowance in every group. Surviving audio and video copies share the same 16-of-24 reconstruction threshold.
+The encoder prioritizes parity shards and only sends packets whose complete fragment set fits in the available audio budget. A fragment lasts 1.056 seconds; a full-size shard requires eight fragments. With the default ten levels, a single full-size shard fits starting at twelve groups (9.1 seconds). Tiny, mostly padded packets often fit in a single fragment. If no complete repair packet fits, the audio track is silence. Audio is supplemental: fast mode does not promise independent audio-only recovery or an additional parity allowance in every group. Surviving audio and video copies share the same 16-of-24 reconstruction threshold.
 
 ### Full audio backup and timing
 
 `--full-audio` writes a complete audio pass of all data and parity shards. Video packets are held and distributed throughout the entire audio duration. One group takes 173.600 seconds; either channel can recover the file independently when enough valid shards survive. The decoder stops early when video alone suffices.
 
-Timing uses integer audio sample and video frame counts. Full mode pads audio to a 30 fps frame boundary; when supported by FFmpeg, the MP4 movie clock runs at 48 kHz to avoid millisecond rounding of AAC edit durations. With the default settings, fast mode uses exactly 72 frames per group and pads unused audio time with silence. Audio and video are aligned to the same end time, subject to millisecond rounding on older FFmpeg versions.
+Timing uses integer audio sample and video frame counts. Full mode pads audio to a 30 fps frame boundary; when supported by FFmpeg, the MP4 movie clock runs at 48 kHz to avoid millisecond rounding of AAC edit durations. Fast mode calculates the frame count from the selected brightness levels, tile size and packet placement, then pads unused audio time with silence. Audio and video are aligned to the same end time, subject to millisecond rounding on older FFmpeg versions.
 
 ### Decoding and supported formats
 
