@@ -1,4 +1,5 @@
 mod audio;
+mod packed;
 mod progress;
 mod repair;
 mod streaming;
@@ -602,6 +603,8 @@ fn encode(
     gray_levels: usize,
 ) -> io::Result<()> {
     let geometry = TileGeometry::with_levels(tile_size, gray_levels);
+    let dense =
+        packed::Layout::enabled(gray_levels).then(|| packed::Layout::new(tile_size, gray_levels));
     // Closer brightness levels need less quantization even before transcoding.
     let crf = 16usize
         .saturating_sub(gray_levels.saturating_sub(4) * 2)
@@ -611,13 +614,31 @@ fn encode(
     let mut prepared = PreparedInput::new(Path::new(input))?;
     let groups = prepared.metadata.groups;
     let size = prepared.metadata.size;
-    let timeline = timeline_transport(
+    let mut timeline = timeline_transport(
         groups as usize,
         full_audio,
         units_per_frame,
         units_per_packet,
     )?;
-    let input_rate = if full_audio {
+    let dense_frames =
+        dense.map(|layout| layout.frames(groups as u64 * SHARDS as u64 * COPIES as u64));
+    if !full_audio {
+        if let Some(frames) = dense_frames {
+            timeline.frames = frames;
+            timeline.samples = frames * (audio::RATE / FPS) as u64;
+        }
+    }
+    let input_rate = if full_audio && dense.is_some() {
+        // Reduce before passing to FFmpeg, whose frame-rate components use
+        // 32-bit integers even though our sample/frame counters are u64.
+        let numerator = dense_frames.unwrap() * audio::RATE as u64;
+        let denominator = timeline.samples;
+        let (mut divisor, mut rest) = (numerator, denominator);
+        while rest != 0 {
+            (divisor, rest) = (rest, divisor % rest);
+        }
+        format!("{}/{}", numerator / divisor, denominator / divisor)
+    } else if full_audio {
         format!(
             "{}/{}",
             COPIES * audio::RATE * units_per_packet,
@@ -770,11 +791,21 @@ fn encode(
         // Send the same shard position from each group before the next position.
         // Copies are separate passes, so a short burst cannot erase all copies.
         let mut pending = Vec::with_capacity(geometry.unit_bytes() * units_per_frame);
-        let mut renderer = FrameRenderer::with_levels(color, tile_size, gray_levels);
+        let mut renderer = dense
+            .is_none()
+            .then(|| FrameRenderer::with_levels(color, tile_size, gray_levels));
+        let mut dense_renderer = dense.map(|layout| packed::Renderer::new(layout, color));
+        let mut packer = dense.map(packed::Packer::new);
         for _ in 0..COPIES {
             for shard in 0..SHARDS {
                 for group in 0..groups {
                     let packet = prepared.packet(group, shard)?;
+                    if let Some(packer) = packer.as_mut() {
+                        packer.packet(group * SHARDS as u32 + shard as u32, &packet, |bytes| {
+                            pipe.write_all(dense_renderer.as_mut().unwrap().render(bytes))
+                        })?;
+                        continue;
+                    }
                     let units = if geometry.fragmented() {
                         repair::full_fragments(group * SHARDS as u32 + shard as u32, &packet)
                     } else {
@@ -783,16 +814,20 @@ fn encode(
                     for unit in units {
                         pending.extend_from_slice(&unit);
                         if pending.len() == geometry.unit_bytes() * units_per_frame {
-                            pipe.write_all(renderer.render(&pending))?;
+                            pipe.write_all(renderer.as_mut().unwrap().render(&pending))?;
                             pending.clear();
                         }
                     }
                 }
             }
         }
+        if let Some(packer) = packer.as_mut() {
+            packer
+                .finish(|bytes| pipe.write_all(dense_renderer.as_mut().unwrap().render(bytes)))?;
+        }
         if !pending.is_empty() {
             pending.resize(geometry.unit_bytes() * units_per_frame, 0);
-            pipe.write_all(renderer.render(&pending))?;
+            pipe.write_all(renderer.as_mut().unwrap().render(&pending))?;
         }
         Ok(())
     })();
@@ -881,10 +916,20 @@ fn decode(input: &str, output: &str) -> io::Result<()> {
                     .collect()
             };
             for (tile_size, levels) in candidates {
+                let dense = packed::Layout::enabled(levels);
                 let geometry = TileGeometry::with_levels(tile_size, levels);
-                let packed = frame_to_bytes(&frame, tile_size, levels);
-                for unit in packed.chunks(geometry.unit_bytes()) {
-                    if geometry.fragmented() {
+                let bytes = if dense {
+                    packed::Layout::new(tile_size, levels).decode(&frame)
+                } else {
+                    frame_to_bytes(&frame, tile_size, levels)
+                };
+                let units: Vec<_> = if dense {
+                    packed::units(&bytes).collect()
+                } else {
+                    bytes.chunks(geometry.unit_bytes()).collect()
+                };
+                for unit in units {
+                    if unit.len() == repair::BYTES {
                         if repair::valid_fragment(unit) {
                             detected_format = Some((tile_size, levels));
                             if let Some(packet) = video_assembler.accept(unit)? {

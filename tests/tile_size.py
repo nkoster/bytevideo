@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check every tile size through H.264, without audio recovery."""
+import argparse
 import json
 from pathlib import Path
 import random
@@ -9,6 +10,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
 BIN = ROOT / "target/release/bytevideo"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--levels", type=int, nargs="+", choices=range(2, 11), default=range(2, 11))
+options = parser.parse_args()
 
 
 def run(*args):
@@ -19,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix="bytevideo-tiles-") as directory:
     work = Path(directory)
     source = work / "input.bin"
     source.write_bytes(random.Random(42).randbytes(60000))  # Three groups.
-    cases = [(size, levels) for levels in range(2, 11) for size in range(2, 11)]
+    cases = [(size, levels) for levels in options.levels for size in range(2, 11)]
     for size, levels in cases:
         for color in [False, True]:
             original = work / f"tiles{size}-levels{levels}-{color}.mp4"
@@ -30,14 +34,39 @@ with tempfile.TemporaryDirectory(prefix="bytevideo-tiles-") as directory:
             ))["streams"]
             video, audio = [next(s for s in streams if s["codec_type"] == kind)
                             for kind in ["video", "audio"]]
-            digits = 1
-            while levels ** digits < 256:
-                digits += 1
-            capacity = (1280 // size // digits) * (720 // size)
-            fragmented = capacity < 1800
-            units = capacity // (256 if fragmented else 1800)
-            total = 3 * 24 * 3 * (8 if fragmented else 1)
-            frames = (total + units - 1) // units
+            if levels in [2, 4]:
+                digits = 8 if levels == 2 else 4
+                capacity = (1280 // size // digits) * (720 // size)
+                fragmented = capacity < 1800
+                units = capacity // (256 if fragmented else 1800)
+                total = 3 * 24 * 3 * (8 if fragmented else 1)
+                frames = (total + units - 1) // units
+            else:
+                # Select the best bounded radix block, then account for packet
+                # fragments filling the remainder of each frame.
+                blocks = []
+                for count in range(1, 8):
+                    digits = 1
+                    while levels ** digits < 256 ** count:
+                        digits += 1
+                    blocks.append((digits / count, count, digits))
+                _, count, digits = min(blocks)
+                capacity = ((1280 // size) * (720 // size) // digits) * count
+                frames, used = 0, 0
+                for _ in range(3 * 24 * 3):
+                    if capacity - used < 256:
+                        frames += 1
+                        used = 0
+                    lengths = [1800] if capacity - used >= 1800 else [256] * 8
+                    for length in lengths:
+                        if used + length > capacity:
+                            frames += 1
+                            used = 0
+                        used += length
+                    if used == capacity:
+                        frames += 1
+                        used = 0
+                frames += bool(used)
             assert int(video["nb_frames"]) == frames
             assert video["avg_frame_rate"] == "30/1"
             assert abs(float(video["duration"]) - frames / 30) < 1 / 48000
