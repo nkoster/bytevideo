@@ -71,9 +71,11 @@ Place options after the output filename. They can be combined in any order. Valu
 
 Smaller tiles and closer brightness levels can be more vulnerable to compression and scaling. More capacity does not necessarily mean a smaller MP4. At 5–10 levels, the encoder increases quality to preserve the smaller brightness differences, which can increase file size. Color is decorative and does not add data capacity.
 
-### Progress and roundtrip testing
+### Progress
 
 Progress is displayed on stderr when connected to a terminal. Encoding shows audio preparation and actual FFmpeg output frames. Video decoding counts useful shards recovered toward reconstruction, so it can reach 100% before the recording ends. The percentage is a packet-recovery target, not the fraction of the file already restored: every group must have enough valid shards. Audio scanning uses a spinner when the total is unknown. Redirected output contains no progress display.
+
+### Roundtrip testing
 
 For a YouTube roundtrip, test a processed YouTube rendition rather than the original upload. Check that the downloaded file contains the intended video resolution and an audio stream if audio repair is needed. Recovery after YouTube processing or other transcoding is not guaranteed.
 
