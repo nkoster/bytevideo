@@ -49,24 +49,23 @@ Place options after the output filename. They can be combined in any order. Valu
 | `--color [NAME]` | `red`, `green`, `blue`, `rasta` | Off | Uses one tint, or the Rasta pattern when no name is given. Also accepts `--color=NAME`. |
 | `--full-audio` | Flag | Off | Adds a complete audio backup and extends the recording to fit it. |
 
+### Examples
+
 ```sh
 # Default ten levels, with red/yellow/green tiles.
 ./target/release/bytevideo encode input.bin colorful.mp4 --color
 
-# Four brightness levels, with red/yellow/green tiles.
-./target/release/bytevideo encode input.bin four-levels.mp4 --gray-levels 4 --color
+# Smallest MP4
+./target/release/bytevideo encode input.bin four-levels.mp4 --gray-levels 2
 
 # Ten brightness levels, with only red tints.
 ./target/release/bytevideo encode input.bin red.mp4 --gray-levels 10 --color red
 
-# Smaller tiles for roundtrip experiments.
-./target/release/bytevideo encode input.bin tiles3.mp4 --tile-size 3
+# Smaller tiles for roundtrip experiments. (will not decode! this will be removed)
+./target/release/bytevideo encode input.bin tiles3.mp4 --tile-size 6
 
 # A complete independent backup in audio; substantially slower.
 ./target/release/bytevideo encode input.bin backup.mp4 --full-audio
-
-# Options can be combined.
-./target/release/bytevideo encode input.bin experiment.mp4 --tile-size 6 --gray-levels 3 --color
 ```
 
 Smaller tiles and closer brightness levels can be more vulnerable to compression and scaling. More capacity does not necessarily mean a smaller MP4. At 5–10 levels, the encoder increases quality to preserve the smaller brightness differences, which can increase file size. Color is decorative and does not add data capacity.
